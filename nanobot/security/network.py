@@ -3,10 +3,16 @@
 from __future__ import annotations
 
 import ipaddress
+import json
+import os
 import re
 import socket
+from pathlib import Path
 from urllib.parse import urlparse
 
+# ---------------------------------------------------------------------------
+# Blocked private/internal networks (SSRF protection)
+# ---------------------------------------------------------------------------
 _BLOCKED_NETWORKS = [
     ipaddress.ip_network("0.0.0.0/8"),
     ipaddress.ip_network("10.0.0.0/8"),
@@ -20,10 +26,66 @@ _BLOCKED_NETWORKS = [
     ipaddress.ip_network("fe80::/10"),         # link-local v6
 ]
 
+# ---------------------------------------------------------------------------
+# Allowlist — loaded from ~/.nanobot/config.json → tools → networkAllowlist
+# ---------------------------------------------------------------------------
+_ALLOWED_IPS: set[str] = set()
+_ALLOWED_NETWORKS: list[ipaddress.IPv4Network | ipaddress.IPv6Network] = []
+_ALLOWLIST_LOADED = False
+
 _URL_RE = re.compile(r"https?://[^\s\"'`;|<>]+", re.IGNORECASE)
 
 
+def _load_allowlist():
+    """Load the private-IP allowlist from config.json (lazy, once)."""
+    global _ALLOWED_IPS, _ALLOWED_NETWORKS, _ALLOWLIST_LOADED
+    if _ALLOWLIST_LOADED:
+        return
+
+    home = os.environ.get("HOME", "")
+    config_path = Path(home) / ".nanobot" / "config.json"
+    if not config_path.exists():
+        _ALLOWLIST_LOADED = True
+        return
+
+    try:
+        with open(config_path, "r") as f:
+            data = json.load(f)
+        tools_cfg = data.get("tools", {})
+        entries = tools_cfg.get("networkAllowlist", [])
+    except Exception:
+        _ALLOWLIST_LOADED = True
+        return
+
+    for entry in entries:
+        try:
+            addr = ipaddress.ip_address(entry)
+            _ALLOWED_IPS.add(str(addr))
+        except ValueError:
+            try:
+                net = ipaddress.ip_network(entry, strict=False)
+                _ALLOWED_NETWORKS.append(net)
+            except ValueError:
+                pass  # skip invalid silently
+
+    _ALLOWLIST_LOADED = True
+
+
 def _is_private(addr: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    """Check if an address is in a blocked private/internal range.
+
+    Addresses in the allowlist (config.json → tools → networkAllowlist) are
+    exempted and will return False (i.e. NOT private).
+    """
+    _load_allowlist()
+
+    # Allowlist takes priority
+    if str(addr) in _ALLOWED_IPS:
+        return False
+    for net in _ALLOWED_NETWORKS:
+        if addr in net:
+            return False
+
     return any(addr in net for net in _BLOCKED_NETWORKS)
 
 
