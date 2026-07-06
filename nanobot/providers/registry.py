@@ -434,6 +434,7 @@ PROVIDERS: tuple[ProviderSpec, ...] = (
         default_api_base="http://localhost:11434",
         strip_model_prefix=False,
         model_overrides=(),
+        litellm_kwargs={"think": False},  # disable built-in thinking mode (Qwen3 etc.)
     ),
     # === Auxiliary (not a primary LLM provider) ============================
     # Groq: mainly used for Whisper voice transcription, also usable for LLM.

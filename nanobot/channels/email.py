@@ -3,6 +3,7 @@
 import asyncio
 import html
 import imaplib
+import mimetypes
 import re
 import smtplib
 import ssl
@@ -12,6 +13,7 @@ from email.header import decode_header, make_header
 from email.message import EmailMessage
 from email.parser import BytesParser
 from email.utils import parseaddr
+from pathlib import Path
 from typing import Any
 
 from loguru import logger
@@ -181,8 +183,25 @@ class EmailChannel(BaseChannel):
             email_msg["In-Reply-To"] = in_reply_to
             email_msg["References"] = in_reply_to
 
+        # Attach any files listed in msg.media
+        for file_path in (msg.media or []):
+            p = Path(file_path)
+            if not p.is_file():
+                logger.warning("Email attachment not found, skipping: {}", file_path)
+                continue
+            mime, _ = mimetypes.guess_type(str(p))
+            maintype, subtype = (mime or "application/octet-stream").split("/", 1)
+            email_msg.add_attachment(
+                p.read_bytes(),
+                maintype=maintype,
+                subtype=subtype,
+                filename=p.name,
+            )
+            logger.info("Email: attached {} ({}/{})", p.name, maintype, subtype)
+
         try:
             await asyncio.to_thread(self._smtp_send, email_msg)
+            logger.info("Email sent to {}", to_addr)
         except Exception as e:
             logger.error("Error sending email to {}: {}", to_addr, e)
             raise

@@ -1,16 +1,8 @@
 # Heartbeat Tasks
 
-This file is checked every 30 minutes by your nanobot agent.
-Add tasks below that you want the agent to work on periodically.
-
-If this file has no tasks (only headers and comments), the agent will skip the heartbeat.
+Checked every 30 min. Date-gated tasks: write `YYYY-MM-DD` to a small `.txt` file in workspace and reference it by name in the task description — the harness injects it and skips automatically if it matches today.
 
 ## Active Tasks
 
-<!-- Add your periodic tasks below this line -->
-
-
 ## Completed
-
-<!-- Move completed tasks here or delete them -->
 

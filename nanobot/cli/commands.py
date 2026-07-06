@@ -3,6 +3,7 @@
 import asyncio
 from contextlib import contextmanager, nullcontext
 import os
+from loguru import logger
 import select
 import signal
 import sys
@@ -361,55 +362,136 @@ def _onboard_plugins(config_path: Path) -> None:
         json.dump(data, f, indent=2, ensure_ascii=False)
 
 
-def _make_provider(config: Config):
-    """Create the appropriate LLM provider from config."""
+def _make_provider_instance(provider_name: str, model: str, config: "Config") -> "LLMProvider":
+    """Instantiate a single provider for the given provider_name and model.
+
+    Unlike _make_provider, this does not validate API keys (callers handle that)
+    and does not set generation settings — it just constructs the object.
+    """
+    from nanobot.providers.registry import find_by_name
+
+    p = getattr(config.providers, provider_name, None)
+
+    if provider_name == "openai_codex" or model.startswith("openai-codex/"):
+        from nanobot.providers.openai_codex_provider import OpenAICodexProvider
+        return OpenAICodexProvider(default_model=model)
+
+    if provider_name == "custom":
+        from nanobot.providers.custom_provider import CustomProvider
+        return CustomProvider(
+            api_key=p.api_key if p else "no-key",
+            api_base=(p.api_base if p else None) or "http://localhost:8000/v1",
+            default_model=model,
+            extra_headers=p.extra_headers if p else None,
+            request_timeout=p.request_timeout if p else None,
+        )
+
+    if provider_name == "azure_openai":
+        from nanobot.providers.azure_openai_provider import AzureOpenAIProvider
+        if not p or not p.api_key or not p.api_base:
+            raise ValueError("azure_openai requires api_key and api_base in config")
+        return AzureOpenAIProvider(api_key=p.api_key, api_base=p.api_base, default_model=model)
+
+    from nanobot.providers.litellm_provider import LiteLLMProvider
+    spec = find_by_name(provider_name)
+    api_base = (p.api_base if p else None)
+    if not api_base and spec and (spec.is_gateway or spec.is_local) and spec.default_api_base:
+        api_base = spec.default_api_base
+    return LiteLLMProvider(
+        api_key=p.api_key if p else None,
+        api_base=api_base,
+        default_model=model,
+        extra_headers=p.extra_headers if p else None,
+        provider_name=provider_name,
+        request_timeout=p.request_timeout if p else None,
+        context_window_tokens=config.agents.defaults.context_window_tokens,
+    )
+
+
+
+def _make_fast_provider(config: "Config") -> "LLMProvider | None":
+    """Build a standalone fast provider (kobold) for background decision calls.
+
+    Used for heartbeat Phase 1, post-run evaluation, and simple background tasks.
+    No fallback chain — callers default gracefully on failure.
+    """
     from nanobot.providers.base import GenerationSettings
-    from nanobot.providers.openai_codex_provider import OpenAICodexProvider
-    from nanobot.providers.azure_openai_provider import AzureOpenAIProvider
+
+    defaults = config.agents.defaults
+    if not defaults.fast_provider or not defaults.fast_model:
+        return None
+    try:
+        fp = _make_provider_instance(defaults.fast_provider, defaults.fast_model, config)
+        fp.generation = GenerationSettings(
+            temperature=defaults.temperature,
+            max_tokens=defaults.max_tokens,
+            reasoning_effort=defaults.reasoning_effort,
+        )
+        logger.info("Fast provider (background): {}/{}", defaults.fast_provider, defaults.fast_model)
+        return fp
+    except Exception as e:
+        logger.warning("Fast provider setup failed, background calls will use heavy model: {}", e)
+        return None
+
+
+def _make_provider(config: "Config"):
+    """Create the appropriate LLM provider from config, with optional fallback chain."""
+    from nanobot.providers.base import GenerationSettings
+    from nanobot.providers.registry import find_by_name
 
     model = config.agents.defaults.model
     provider_name = config.get_provider_name(model)
     p = config.get_provider(model)
 
-    # OpenAI Codex (OAuth)
-    if provider_name == "openai_codex" or model.startswith("openai-codex/"):
-        provider = OpenAICodexProvider(default_model=model)
-    # Custom: direct OpenAI-compatible endpoint, bypasses LiteLLM
-    elif provider_name == "custom":
-        from nanobot.providers.custom_provider import CustomProvider
-        provider = CustomProvider(
-            api_key=p.api_key if p else "no-key",
-            api_base=config.get_api_base(model) or "http://localhost:8000/v1",
-            default_model=model,
-            extra_headers=p.extra_headers if p else None,
-        )
-    # Azure OpenAI: direct Azure OpenAI endpoint with deployment name
+    # Validate primary provider API key before constructing anything.
+    if provider_name not in ("openai_codex", "custom", "azure_openai"):
+        spec = find_by_name(provider_name)
+        if (
+            not model.startswith("bedrock/")
+            and not (p and p.api_key)
+            and not (spec and (spec.is_oauth or spec.is_local))
+        ):
+            console.print("[red]Error: No API key configured.[/red]")
+            console.print("Set one in ~/.nanobot/config.json under providers section")
+            raise typer.Exit(1)
     elif provider_name == "azure_openai":
         if not p or not p.api_key or not p.api_base:
             console.print("[red]Error: Azure OpenAI requires api_key and api_base.[/red]")
             console.print("Set them in ~/.nanobot/config.json under providers.azure_openai section")
             console.print("Use the model field to specify the deployment name.")
             raise typer.Exit(1)
-        provider = AzureOpenAIProvider(
-            api_key=p.api_key,
-            api_base=p.api_base,
-            default_model=model,
-        )
-    else:
-        from nanobot.providers.litellm_provider import LiteLLMProvider
-        from nanobot.providers.registry import find_by_name
-        spec = find_by_name(provider_name)
-        if not model.startswith("bedrock/") and not (p and p.api_key) and not (spec and (spec.is_oauth or spec.is_local)):
-            console.print("[red]Error: No API key configured.[/red]")
-            console.print("Set one in ~/.nanobot/config.json under providers section")
-            raise typer.Exit(1)
-        provider = LiteLLMProvider(
-            api_key=p.api_key if p else None,
-            api_base=config.get_api_base(model),
-            default_model=model,
-            extra_headers=p.extra_headers if p else None,
-            provider_name=provider_name,
-        )
+
+    provider = _make_provider_instance(provider_name, model, config)
+
+    # Build fallback chain: primary → configured fallbacks → fast model as last resort.
+    defaults = config.agents.defaults
+    fallback_entries = defaults.fallback_chain
+    fast_provider_name = defaults.fast_provider
+    fast_model_name = defaults.fast_model
+    has_fast = bool(fast_provider_name and fast_model_name)
+    if fallback_entries or has_fast:
+        from nanobot.providers.fallback_provider import FallbackEntry, FallbackProvider
+        chain = [FallbackEntry(provider=provider, model=model)]
+        for fb in fallback_entries:
+            if not fb.provider or not fb.model:
+                continue
+            try:
+                fb_provider = _make_provider_instance(fb.provider, fb.model, config)
+                chain.append(FallbackEntry(provider=fb_provider, model=fb.model))
+                logger.info("Fallback provider registered: {}/{}", fb.provider, fb.model)
+            except Exception as e:
+                logger.warning("Skipping fallback {}/{}: {}", fb.provider, fb.model, e)
+        if has_fast:
+            # Append fast model as last resort unless it's the same as the primary.
+            if not (fast_provider_name == provider_name and fast_model_name == model):
+                try:
+                    fast_p = _make_provider_instance(fast_provider_name, fast_model_name, config)
+                    chain.append(FallbackEntry(provider=fast_p, model=fast_model_name))
+                    logger.info("Fast model as last fallback: {}/{}", fast_provider_name, fast_model_name)
+                except Exception as e:
+                    logger.warning("Skipping fast fallback {}/{}: {}", fast_provider_name, fast_model_name, e)
+        if len(chain) > 1:
+            provider = FallbackProvider(chain)
 
     defaults = config.agents.defaults
     provider.generation = GenerationSettings(
@@ -483,6 +565,7 @@ def gateway(
     sync_workspace_templates(config.workspace_path)
     bus = MessageBus()
     provider = _make_provider(config)
+    fast_provider = _make_fast_provider(config)
     session_manager = SessionManager(config.workspace_path)
 
     # Create cron service first (callback set after agent creation)
@@ -505,6 +588,8 @@ def gateway(
         session_manager=session_manager,
         mcp_servers=config.tools.mcp_servers,
         channels_config=config.channels,
+        fast_provider=fast_provider,
+        fast_model=config.agents.defaults.fast_model or None,
     )
 
     # Set cron callback (needs agent)
@@ -530,6 +615,7 @@ def gateway(
                 session_key=f"cron:{job.id}",
                 channel=job.payload.channel or "cli",
                 chat_id=job.payload.to or "direct",
+                is_background=True,
             )
         finally:
             if isinstance(cron_tool, CronTool) and cron_token is not None:
@@ -542,6 +628,8 @@ def gateway(
         if job.payload.deliver and job.payload.to and response:
             should_notify = await evaluate_response(
                 response, job.payload.message, provider, agent.model,
+                fast_provider=fast_provider,
+                fast_model=config.agents.defaults.fast_model or None,
             )
             if should_notify:
                 from nanobot.bus.events import OutboundMessage
@@ -586,6 +674,7 @@ def gateway(
             channel=channel,
             chat_id=chat_id,
             on_progress=_silent,
+            is_background=True,
         )
 
     async def on_heartbeat_notify(response: str) -> None:
@@ -605,6 +694,8 @@ def gateway(
         on_notify=on_heartbeat_notify,
         interval_s=hb_cfg.interval_s,
         enabled=hb_cfg.enabled,
+        fast_provider=fast_provider,
+        fast_model=config.agents.defaults.fast_model or None,
     )
 
     if channels.enabled_channels:

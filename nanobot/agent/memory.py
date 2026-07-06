@@ -310,7 +310,7 @@ class MemoryConsolidator:
             estimated, source = self.estimate_session_prompt_tokens(session)
             if estimated <= 0:
                 return
-            if estimated < self.context_window_tokens:
+            if estimated < self.context_window_tokens * 0.80:
                 logger.debug(
                     "Token consolidation idle {}: {}/{} via {}",
                     session.key,

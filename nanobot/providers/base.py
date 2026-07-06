@@ -75,6 +75,9 @@ class LLMProvider(ABC):
     """
 
     _CHAT_RETRY_DELAYS = (1, 2, 4)
+    # Delays for cold-start rejections (e.g. Ollama paging a model back in).
+    # Longer than regular transient delays because model loading takes ~30s.
+    _COLD_START_RETRY_DELAYS = (5, 15, 30)
     _TRANSIENT_ERROR_MARKERS = (
         "429",
         "rate limit",
@@ -88,6 +91,22 @@ class LLMProvider(ABC):
         "connection",
         "server error",
         "temporarily unavailable",
+    )
+    # Errors that indicate the backend queue is full or the connection timed out
+    # waiting for a slow local model — retrying makes congestion worse.
+    # These immediately fall through to the next fallback provider.
+    _QUEUE_FULL_MARKERS = (
+        "server is busy",
+        "queue is full",
+        "too many requests in queue",
+        "readtimeout",       # httpx.ReadTimeout class name
+        "request timed out", # litellm's human-readable timeout message
+    )
+    # Errors that indicate the backend is temporarily unavailable (e.g. Ollama
+    # returning an empty body while paging a model back into memory).
+    # Retried with longer delays than normal transient errors.
+    _COLD_START_MARKERS = (
+        "expecting value: line 1 column 1",
     )
 
     _SENTINEL = object()
@@ -192,6 +211,18 @@ class LLMProvider(ABC):
         err = (content or "").lower()
         return any(marker in err for marker in cls._TRANSIENT_ERROR_MARKERS)
 
+    @classmethod
+    def _is_queue_full_error(cls, content: str | None) -> bool:
+        """Return True when the backend queue is full — retrying will worsen congestion."""
+        err = (content or "").lower()
+        return any(marker in err for marker in cls._QUEUE_FULL_MARKERS)
+
+    @classmethod
+    def _is_cold_start_error(cls, content: str | None) -> bool:
+        """Return True when the backend is temporarily unavailable (e.g. model loading)."""
+        err = (content or "").lower()
+        return any(marker in err for marker in cls._COLD_START_MARKERS)
+
     @staticmethod
     def _strip_image_content(messages: list[dict[str, Any]]) -> list[dict[str, Any]] | None:
         """Replace image_url blocks with text placeholder. Returns None if no images found."""
@@ -258,6 +289,26 @@ class LLMProvider(ABC):
             if response.finish_reason != "error":
                 return response
 
+            if self._is_queue_full_error(response.content):
+                logger.warning(
+                    "LLM backend queue full, skipping retries: {}",
+                    (response.content or "")[:120].lower(),
+                )
+                return response
+
+            if self._is_cold_start_error(response.content):
+                for cs_attempt, cs_delay in enumerate(self._COLD_START_RETRY_DELAYS, start=1):
+                    logger.warning(
+                        "LLM backend cold-start (attempt {}/{}), retrying in {}s: {}",
+                        cs_attempt, len(self._COLD_START_RETRY_DELAYS), cs_delay,
+                        (response.content or "")[:120].lower(),
+                    )
+                    await asyncio.sleep(cs_delay)
+                    response = await self._safe_chat(**kw)
+                    if response.finish_reason != "error" or not self._is_cold_start_error(response.content):
+                        return response
+                return response
+
             if not self._is_transient_error(response.content):
                 stripped = self._strip_image_content(messages)
                 if stripped is not None:
@@ -278,3 +329,8 @@ class LLMProvider(ABC):
     def get_default_model(self) -> str:
         """Get the default model for this provider."""
         pass
+
+    @property
+    def active_model(self) -> str:
+        """Return the model currently being used. Overridden by FallbackProvider."""
+        return self.get_default_model()

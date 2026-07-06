@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import re
+from datetime import date
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Coroutine
 
@@ -10,6 +12,13 @@ from loguru import logger
 
 if TYPE_CHECKING:
     from nanobot.providers.base import LLMProvider
+
+_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+_TEMPLATE_FILES = frozenset({
+    "HEARTBEAT.md", "HEARTBEAT-old.md", "AGENTS.md", "SOUL.md", "USER.md", "TOOLS.md",
+})
+_MAX_STATE_FILE_BYTES = 256
 
 _HEARTBEAT_TOOL = [
     {
@@ -59,10 +68,14 @@ class HeartbeatService:
         on_notify: Callable[[str], Coroutine[Any, Any, None]] | None = None,
         interval_s: int = 30 * 60,
         enabled: bool = True,
+        fast_provider: LLMProvider | None = None,
+        fast_model: str | None = None,
     ):
         self.workspace = workspace
         self.provider = provider
         self.model = model
+        self.fast_provider = fast_provider
+        self.fast_model = fast_model or (fast_provider.get_default_model() if fast_provider else None)
         self.on_execute = on_execute
         self.on_notify = on_notify
         self.interval_s = interval_s
@@ -73,6 +86,26 @@ class HeartbeatService:
     @property
     def heartbeat_file(self) -> Path:
         return self.workspace / "HEARTBEAT.md"
+
+    def _collect_workspace_state(self) -> dict[str, str]:
+        """Read small .txt state files from workspace root to inject into decide prompt."""
+        state: dict[str, str] = {}
+        try:
+            for path in self.workspace.iterdir():
+                if (
+                    path.is_file()
+                    and path.suffix == ".txt"
+                    and not path.name.startswith(".")
+                    and path.name not in _TEMPLATE_FILES
+                    and path.stat().st_size <= _MAX_STATE_FILE_BYTES
+                ):
+                    try:
+                        state[path.name] = path.read_text(encoding="utf-8").strip()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
+        return state
 
     def _read_heartbeat_file(self) -> str | None:
         if self.heartbeat_file.exists():
@@ -89,17 +122,26 @@ class HeartbeatService:
         """
         from nanobot.utils.helpers import current_time_str
 
-        response = await self.provider.chat_with_retry(
+        decide_provider = self.fast_provider or self.provider
+        decide_model = self.fast_model or self.model
+        response = await decide_provider.chat_with_retry(
             messages=[
-                {"role": "system", "content": "You are a heartbeat agent. Call the heartbeat tool to report your decision."},
+                {"role": "system", "content": (
+                    "You are a heartbeat agent. Review the workspace state and HEARTBEAT.md, "
+                    "then call the heartbeat tool. Use 'skip' if all tasks are already completed "
+                    "for today based on their last-run dates in the workspace state. Use 'run' only "
+                    "if a task genuinely needs to execute right now."
+                )},
                 {"role": "user", "content": (
                     f"Current Time: {current_time_str()}\n\n"
-                    "Review the following HEARTBEAT.md and decide whether there are active tasks.\n\n"
+                    "Check the workspace state dates against the current time. "
+                    "If a task's last-run date matches today, it is already done — use skip. "
+                    "Otherwise use run.\n\n"
                     f"{content}"
                 )},
             ],
             tools=_HEARTBEAT_TOOL,
-            model=self.model,
+            model=decide_model,
         )
 
         if not response.has_tool_calls:
@@ -149,6 +191,19 @@ class HeartbeatService:
             logger.debug("Heartbeat: HEARTBEAT.md missing or empty")
             return
 
+        state = self._collect_workspace_state()
+        today = date.today().isoformat()
+        if state:
+            date_states = {k: v for k, v in state.items() if _DATE_PATTERN.match(v)}
+            if date_states and all(v == today for v in date_states.values()):
+                logger.info("Heartbeat: all date-gated tasks done today, skipping")
+                return
+            state_lines = "\n".join(
+                f"- {k}: {v} ({'done today — skip' if _DATE_PATTERN.match(v) and v == today else 'stale — run' if _DATE_PATTERN.match(v) else ''})"
+                for k, v in state.items()
+            )
+            content = f"## Workspace State\n{state_lines}\n\n{content}"
+
         logger.info("Heartbeat: checking for tasks...")
 
         try:
@@ -164,7 +219,9 @@ class HeartbeatService:
 
                 if response:
                     should_notify = await evaluate_response(
-                        response, tasks, self.provider, self.model,
+                        response, tasks,
+                        self.fast_provider or self.provider,
+                        self.fast_model or self.model,
                     )
                     if should_notify and self.on_notify:
                         logger.info("Heartbeat: completed, delivering response")
@@ -179,6 +236,14 @@ class HeartbeatService:
         content = self._read_heartbeat_file()
         if not content:
             return None
+        state = self._collect_workspace_state()
+        if state:
+            today = date.today().isoformat()
+            state_lines = "\n".join(
+                f"- {k}: {v} ({'done today — skip' if _DATE_PATTERN.match(v) and v == today else 'stale — run' if _DATE_PATTERN.match(v) else ''})"
+                for k, v in state.items()
+            )
+            content = f"## Workspace State\n{state_lines}\n\n{content}"
         action, tasks = await self._decide(content)
         if action != "run" or not self.on_execute:
             return None

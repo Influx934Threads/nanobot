@@ -1,16 +1,16 @@
-"""Regression tests for PR #2026 — litellm_kwargs injection from ProviderSpec.
+"""Regression tests for LiteLLM provider routing behavior.
 
 Validates that:
-- OpenRouter uses litellm_prefix (NOT custom_llm_provider) to avoid LiteLLM double-prefixing.
-- The litellm_kwargs mechanism works correctly for providers that declare it.
-- Non-gateway providers are unaffected.
+- OpenRouter and other OpenAI-compatible gateways use the openai SDK directly.
+- Model names are sent as-is to provider APIs (no LiteLLM routing prefix needed).
+- Anthropic (non-OpenAI wire format) is detected and routed through LiteLLM.
+- custom_llm_provider is never injected into requests.
 """
 
 from __future__ import annotations
 
 from types import SimpleNamespace
-from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
@@ -19,7 +19,7 @@ from nanobot.providers.registry import find_by_name
 
 
 def _fake_response(content: str = "ok") -> SimpleNamespace:
-    """Build a minimal acompletion-shaped response object."""
+    """Build a minimal chat-completion-shaped response object."""
     message = SimpleNamespace(
         content=content,
         tool_calls=None,
@@ -31,8 +31,17 @@ def _fake_response(content: str = "ok") -> SimpleNamespace:
     return SimpleNamespace(choices=[choice], usage=usage)
 
 
+def _mock_create(provider: LiteLLMProvider) -> AsyncMock:
+    """Attach an AsyncMock to the provider's openai client and return it."""
+    fake = AsyncMock(return_value=_fake_response())
+    provider._openai_client.chat = MagicMock()
+    provider._openai_client.chat.completions = MagicMock()
+    provider._openai_client.chat.completions.create = fake
+    return fake
+
+
 def test_openrouter_spec_uses_prefix_not_custom_llm_provider() -> None:
-    """OpenRouter must rely on litellm_prefix, not custom_llm_provider kwarg.
+    """OpenRouter registry spec must use litellm_prefix, not custom_llm_provider kwarg.
 
     LiteLLM internally adds a provider/ prefix when custom_llm_provider is set,
     which double-prefixes models (openrouter/anthropic/model) and breaks the API.
@@ -47,115 +56,104 @@ def test_openrouter_spec_uses_prefix_not_custom_llm_provider() -> None:
 
 @pytest.mark.asyncio
 async def test_openrouter_prefixes_model_correctly() -> None:
-    """OpenRouter should prefix model as openrouter/vendor/model for LiteLLM routing."""
-    mock_acompletion = AsyncMock(return_value=_fake_response())
-
-    with patch("nanobot.providers.litellm_provider.acompletion", mock_acompletion):
-        provider = LiteLLMProvider(
-            api_key="sk-or-test-key",
-            api_base="https://openrouter.ai/api/v1",
-            default_model="anthropic/claude-sonnet-4-5",
-            provider_name="openrouter",
-        )
-        await provider.chat(
-            messages=[{"role": "user", "content": "hello"}],
-            model="anthropic/claude-sonnet-4-5",
-        )
-
-    call_kwargs = mock_acompletion.call_args.kwargs
-    assert call_kwargs["model"] == "openrouter/anthropic/claude-sonnet-4-5", (
-        "LiteLLM needs openrouter/ prefix to detect the provider and strip it before API call"
+    """OpenRouter via openai SDK: model name is sent as-is to the provider's API."""
+    provider = LiteLLMProvider(
+        api_key="sk-or-test-key",
+        api_base="https://openrouter.ai/api/v1",
+        default_model="anthropic/claude-sonnet-4-5",
+        provider_name="openrouter",
     )
+    assert not provider._use_litellm, "OpenRouter should use openai SDK, not LiteLLM"
+    assert "openrouter.ai" in str(provider._openai_client.base_url)
+
+    fake_create = _mock_create(provider)
+    await provider.chat(
+        messages=[{"role": "user", "content": "hello"}],
+        model="anthropic/claude-sonnet-4-5",
+    )
+
+    call_kwargs = fake_create.call_args.kwargs
+    # OpenRouter's API receives the model name without any routing prefix
+    assert call_kwargs["model"] == "anthropic/claude-sonnet-4-5"
     assert "custom_llm_provider" not in call_kwargs
 
 
 @pytest.mark.asyncio
 async def test_non_gateway_provider_no_extra_kwargs() -> None:
-    """Standard (non-gateway) providers must NOT inject any litellm_kwargs."""
-    mock_acompletion = AsyncMock(return_value=_fake_response())
-
-    with patch("nanobot.providers.litellm_provider.acompletion", mock_acompletion):
-        provider = LiteLLMProvider(
-            api_key="sk-ant-test-key",
-            default_model="claude-sonnet-4-5",
-        )
-        await provider.chat(
-            messages=[{"role": "user", "content": "hello"}],
-            model="claude-sonnet-4-5",
-        )
-
-    call_kwargs = mock_acompletion.call_args.kwargs
-    assert "custom_llm_provider" not in call_kwargs, (
-        "Standard Anthropic provider should NOT inject custom_llm_provider"
+    """sk-ant- API keys without explicit provider_name must route through LiteLLM."""
+    provider = LiteLLMProvider(
+        api_key="sk-ant-test-key",
+        default_model="claude-sonnet-4-5",
+    )
+    assert provider._use_litellm, (
+        "sk-ant- key must trigger LiteLLM path (Anthropic uses a non-OpenAI wire format)"
     )
 
 
 @pytest.mark.asyncio
 async def test_gateway_without_litellm_kwargs_injects_nothing_extra() -> None:
-    """Gateways without litellm_kwargs (e.g. AiHubMix) must not add extra keys."""
-    mock_acompletion = AsyncMock(return_value=_fake_response())
+    """AiHubMix (OpenAI-compatible gateway) should use openai SDK with no extra kwargs."""
+    provider = LiteLLMProvider(
+        api_key="sk-aihub-test-key",
+        api_base="https://aihubmix.com/v1",
+        default_model="claude-sonnet-4-5",
+        provider_name="aihubmix",
+    )
+    assert not provider._use_litellm, "AiHubMix should use openai SDK, not LiteLLM"
+    assert "aihubmix.com" in str(provider._openai_client.base_url)
 
-    with patch("nanobot.providers.litellm_provider.acompletion", mock_acompletion):
-        provider = LiteLLMProvider(
-            api_key="sk-aihub-test-key",
-            api_base="https://aihubmix.com/v1",
-            default_model="claude-sonnet-4-5",
-            provider_name="aihubmix",
-        )
-        await provider.chat(
-            messages=[{"role": "user", "content": "hello"}],
-            model="claude-sonnet-4-5",
-        )
+    fake_create = _mock_create(provider)
+    await provider.chat(
+        messages=[{"role": "user", "content": "hello"}],
+        model="claude-sonnet-4-5",
+    )
 
-    call_kwargs = mock_acompletion.call_args.kwargs
+    call_kwargs = fake_create.call_args.kwargs
     assert "custom_llm_provider" not in call_kwargs
 
 
 @pytest.mark.asyncio
 async def test_openrouter_autodetect_by_key_prefix() -> None:
-    """OpenRouter should be auto-detected by sk-or- key prefix even without explicit provider_name."""
-    mock_acompletion = AsyncMock(return_value=_fake_response())
-
-    with patch("nanobot.providers.litellm_provider.acompletion", mock_acompletion):
-        provider = LiteLLMProvider(
-            api_key="sk-or-auto-detect-key",
-            default_model="anthropic/claude-sonnet-4-5",
-        )
-        await provider.chat(
-            messages=[{"role": "user", "content": "hello"}],
-            model="anthropic/claude-sonnet-4-5",
-        )
-
-    call_kwargs = mock_acompletion.call_args.kwargs
-    assert call_kwargs["model"] == "openrouter/anthropic/claude-sonnet-4-5", (
-        "Auto-detected OpenRouter should prefix model for LiteLLM routing"
+    """sk-or- key should auto-detect OpenRouter without explicit provider_name."""
+    provider = LiteLLMProvider(
+        api_key="sk-or-auto-detect-key",
+        default_model="anthropic/claude-sonnet-4-5",
     )
+    assert not provider._use_litellm
+    assert "openrouter.ai" in str(provider._openai_client.base_url)
+
+    fake_create = _mock_create(provider)
+    await provider.chat(
+        messages=[{"role": "user", "content": "hello"}],
+        model="anthropic/claude-sonnet-4-5",
+    )
+
+    call_kwargs = fake_create.call_args.kwargs
+    # Model is sent as-is to OpenRouter — no openrouter/ prefix needed
+    assert call_kwargs["model"] == "anthropic/claude-sonnet-4-5"
 
 
 @pytest.mark.asyncio
 async def test_openrouter_native_model_id_gets_double_prefixed() -> None:
-    """Models like openrouter/free must be double-prefixed so LiteLLM strips one layer.
+    """openrouter/free is an OpenRouter model ID and is sent as-is via the openai SDK.
 
-    openrouter/free is an actual OpenRouter model ID.  LiteLLM strips the first
-    openrouter/ for routing, so we must send openrouter/openrouter/free to ensure
-    the API receives openrouter/free.
+    Previously, LiteLLM required double-prefixing (openrouter/openrouter/free) so it
+    would strip one layer before the API call. The openai SDK sends model names as-is,
+    so openrouter/free reaches the API unchanged — which is exactly what OpenRouter expects.
     """
-    mock_acompletion = AsyncMock(return_value=_fake_response())
+    provider = LiteLLMProvider(
+        api_key="sk-or-test-key",
+        api_base="https://openrouter.ai/api/v1",
+        default_model="openrouter/free",
+        provider_name="openrouter",
+    )
+    fake_create = _mock_create(provider)
+    await provider.chat(
+        messages=[{"role": "user", "content": "hello"}],
+        model="openrouter/free",
+    )
 
-    with patch("nanobot.providers.litellm_provider.acompletion", mock_acompletion):
-        provider = LiteLLMProvider(
-            api_key="sk-or-test-key",
-            api_base="https://openrouter.ai/api/v1",
-            default_model="openrouter/free",
-            provider_name="openrouter",
-        )
-        await provider.chat(
-            messages=[{"role": "user", "content": "hello"}],
-            model="openrouter/free",
-        )
-
-    call_kwargs = mock_acompletion.call_args.kwargs
-    assert call_kwargs["model"] == "openrouter/openrouter/free", (
-        "openrouter/free must become openrouter/openrouter/free — "
-        "LiteLLM strips one layer so the API receives openrouter/free"
+    call_kwargs = fake_create.call_args.kwargs
+    assert call_kwargs["model"] == "openrouter/free", (
+        "openai SDK sends model name as-is; OpenRouter's API receives openrouter/free directly"
     )

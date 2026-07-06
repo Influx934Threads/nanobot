@@ -26,6 +26,13 @@ class ChannelsConfig(Base):
     send_tool_hints: bool = False  # stream tool-call hints (e.g. read_file("…"))
 
 
+class FallbackEntryConfig(Base):
+    """One entry in the provider fallback chain."""
+
+    provider: str = ""
+    model: str = ""
+
+
 class AgentDefaults(Base):
     """Default agent configuration."""
 
@@ -41,6 +48,13 @@ class AgentDefaults(Base):
     # Deprecated compatibility field: accepted from old configs but ignored at runtime.
     memory_window: int | None = Field(default=None, exclude=True)
     reasoning_effort: str | None = None  # low / medium / high — enables LLM thinking mode
+    fallback_chain: list[FallbackEntryConfig] = Field(default_factory=list)
+    # Optional fast-tier provider for simple/conversational messages.
+    # When set, short or conversational messages are routed here instead of the primary model.
+    fast_provider: str = ""
+    fast_model: str = ""
+    # Context window for the fast provider; kept smaller to avoid OOM on low-memory local models.
+    fast_context_window_tokens: int = 8_192
 
     @property
     def should_warn_deprecated_memory_window(self) -> bool:
@@ -60,6 +74,7 @@ class ProviderConfig(Base):
     api_key: str = ""
     api_base: str | None = None
     extra_headers: dict[str, str] | None = None  # Custom headers (e.g. APP-Code for AiHubMix)
+    request_timeout: float | None = None  # Per-request timeout in seconds (None = litellm default)
 
 
 class ProvidersConfig(Base):

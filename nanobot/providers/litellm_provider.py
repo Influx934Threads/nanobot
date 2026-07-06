@@ -1,4 +1,4 @@
-"""LiteLLM provider implementation for multi-provider support."""
+"""LLM provider — openai SDK primary path, lazy LiteLLM fallback for Anthropic."""
 
 import hashlib
 import os
@@ -7,17 +7,42 @@ import string
 from typing import Any
 
 import json_repair
-import litellm
-from litellm import acompletion
+import openai
 from loguru import logger
 
 from nanobot.providers.base import LLMProvider, LLMResponse, ToolCallRequest
-from nanobot.providers.registry import find_by_model, find_gateway
+from nanobot.providers.registry import find_by_model, find_by_name, find_gateway
 
-# Standard chat-completion message keys.
 _ALLOWED_MSG_KEYS = frozenset({"role", "content", "tool_calls", "tool_call_id", "name", "reasoning_content"})
 _ANTHROPIC_EXTRA_KEYS = frozenset({"thinking_blocks"})
 _ALNUM = string.ascii_letters + string.digits
+
+# Providers that need LiteLLM's translation layer (non-OpenAI-compatible wire format).
+# Everything else talks standard /v1/chat/completions via the openai SDK.
+_NEEDS_LITELLM = frozenset({"anthropic"})
+
+# OpenAI-compatible base URLs for known providers.
+# None = use openai SDK default ("openai") or requires explicit api_base in config ("vllm").
+_OPENAI_BASES: dict[str, str | None] = {
+    "openrouter": "https://openrouter.ai/api/v1",
+    "groq": "https://api.groq.com/openai/v1",
+    "deepseek": "https://api.deepseek.com/v1",
+    "moonshot": "https://api.moonshot.ai/v1",
+    "minimax": "https://api.minimax.io/v1",
+    "siliconflow": "https://api.siliconflow.cn/v1",
+    "aihubmix": "https://aihubmix.com/v1",
+    "volcengine": "https://ark.cn-beijing.volces.com/api/v3",
+    "volcengine_coding_plan": "https://ark.cn-beijing.volces.com/api/coding/v3",
+    "byteplus": "https://ark.ap-southeast.bytepluses.com/api/v3",
+    "byteplus_coding_plan": "https://ark.ap-southeast.bytepluses.com/api/coding/v3",
+    "gemini": "https://generativelanguage.googleapis.com/v1beta/openai/",
+    "zhipu": "https://open.bigmodel.cn/api/paas/v4",
+    "dashscope": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+    "ollama": "http://localhost:11434/v1",
+    "vllm": None,
+    "openai": None,
+}
+
 
 def _short_tool_id() -> str:
     """Generate a 9-char alphanumeric ID compatible with all providers (incl. Mistral)."""
@@ -26,11 +51,8 @@ def _short_tool_id() -> str:
 
 class LiteLLMProvider(LLMProvider):
     """
-    LLM provider using LiteLLM for multi-provider support.
-    
-    Supports OpenRouter, Anthropic, OpenAI, Gemini, MiniMax, and many other providers through
-    a unified interface.  Provider-specific logic is driven by the registry
-    (see providers/registry.py) — no if-elif chains needed here.
+    LLM provider using the openai SDK for OpenAI-compatible endpoints.
+    LiteLLM is lazy-imported only for providers that need its translation layer (Anthropic).
     """
 
     def __init__(
@@ -40,56 +62,71 @@ class LiteLLMProvider(LLMProvider):
         default_model: str = "anthropic/claude-opus-4-5",
         extra_headers: dict[str, str] | None = None,
         provider_name: str | None = None,
+        request_timeout: float | None = None,
+        context_window_tokens: int | None = None,
     ):
         super().__init__(api_key, api_base)
         self.default_model = default_model
         self.extra_headers = extra_headers or {}
-
-        # Detect gateway / local deployment.
-        # provider_name (from config key) is the primary signal;
-        # api_key / api_base are fallback for auto-detection.
+        self.request_timeout = request_timeout
+        self.context_window_tokens = context_window_tokens
+        self._provider_name = provider_name
         self._gateway = find_gateway(provider_name, api_key, api_base)
 
-        # Configure environment variables
-        if api_key:
-            self._setup_env(api_key, api_base, default_model)
+        effective_name = self._gateway.name if self._gateway else provider_name
+        # Detect Anthropic by API key prefix when provider_name is not explicitly set
+        if effective_name is None and api_key and api_key.startswith("sk-ant-"):
+            effective_name = "anthropic"
+        self._use_litellm: bool = effective_name in _NEEDS_LITELLM
 
-        if api_base:
-            litellm.api_base = api_base
+        if not self._use_litellm:
+            # Resolve base URL: explicit config > known-provider table > None (OpenAI native)
+            base_url = api_base or _OPENAI_BASES.get(effective_name or "")
+            timeout = request_timeout if request_timeout is not None else openai.NOT_GIVEN
+            self._openai_client = openai.AsyncOpenAI(
+                api_key=api_key or "dummy",
+                base_url=base_url,
+                timeout=timeout,
+                default_headers=self.extra_headers,
+            )
+            # Detect Ollama backend: needs num_ctx + think=False in the request body
+            self._is_ollama = (
+                (self._gateway is not None and self._gateway.name == "ollama")
+                or bool(api_base and "11434" in api_base)
+            )
+        else:
+            # Anthropic path: configure env vars for LiteLLM
+            if api_key:
+                self._setup_env(api_key, api_base, default_model)
+            self._langsmith_enabled = bool(os.getenv("LANGSMITH_API_KEY"))
 
-        # Disable LiteLLM logging noise
-        litellm.suppress_debug_info = True
-        # Drop unsupported parameters for providers (e.g., gpt-5 rejects some params)
-        litellm.drop_params = True
-
-        self._langsmith_enabled = bool(os.getenv("LANGSMITH_API_KEY"))
+    # ------------------------------------------------------------------
+    # LiteLLM env-var setup (Anthropic path only)
+    # ------------------------------------------------------------------
 
     def _setup_env(self, api_key: str, api_base: str | None, model: str) -> None:
-        """Set environment variables based on detected provider."""
-        spec = self._gateway or find_by_model(model)
-        if not spec:
+        spec = (
+            self._gateway
+            or find_by_model(model)
+            or (find_by_name(self._provider_name) if self._provider_name else None)
+        )
+        if not spec or not spec.env_key:
             return
-        if not spec.env_key:
-            # OAuth/provider-only specs (for example: openai_codex)
-            return
-
-        # Gateway/local overrides existing env; standard provider doesn't
         if self._gateway:
             os.environ[spec.env_key] = api_key
         else:
             os.environ.setdefault(spec.env_key, api_key)
-
-        # Resolve env_extras placeholders:
-        #   {api_key}  → user's API key
-        #   {api_base} → user's api_base, falling back to spec.default_api_base
         effective_base = api_base or spec.default_api_base
         for env_name, env_val in spec.env_extras:
-            resolved = env_val.replace("{api_key}", api_key)
-            resolved = resolved.replace("{api_base}", effective_base)
+            resolved = env_val.replace("{api_key}", api_key).replace("{api_base}", effective_base)
             os.environ.setdefault(env_name, resolved)
 
+    # ------------------------------------------------------------------
+    # Model resolution (LiteLLM path only — openai SDK uses bare names)
+    # ------------------------------------------------------------------
+
     def _resolve_model(self, model: str) -> str:
-        """Resolve model name by applying provider/gateway prefixes."""
+        """Apply provider/gateway prefixes required by LiteLLM routing."""
         if self._gateway:
             prefix = self._gateway.litellm_prefix
             if self._gateway.strip_model_prefix:
@@ -97,14 +134,11 @@ class LiteLLMProvider(LLMProvider):
             if prefix:
                 model = f"{prefix}/{model}"
             return model
-
-        # Standard mode: auto-prefix for known providers
-        spec = find_by_model(model)
+        spec = find_by_model(model) or (find_by_name(self._provider_name) if self._provider_name else None)
         if spec and spec.litellm_prefix:
             model = self._canonicalize_explicit_prefix(model, spec.name, spec.litellm_prefix)
             if not any(model.startswith(s) for s in spec.skip_prefixes):
                 model = f"{spec.litellm_prefix}/{model}"
-
         return model
 
     @staticmethod
@@ -117,8 +151,11 @@ class LiteLLMProvider(LLMProvider):
             return model
         return f"{canonical_prefix}/{remainder}"
 
+    # ------------------------------------------------------------------
+    # Cache control
+    # ------------------------------------------------------------------
+
     def _supports_cache_control(self, model: str) -> bool:
-        """Return True when the provider supports cache_control on content blocks."""
         if self._gateway is not None:
             return self._gateway.supports_prompt_caching
         spec = find_by_model(model)
@@ -129,7 +166,6 @@ class LiteLLMProvider(LLMProvider):
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None,
     ) -> tuple[list[dict[str, Any]], list[dict[str, Any]] | None]:
-        """Return copies of messages and tools with cache_control injected."""
         new_messages = []
         for msg in messages:
             if msg.get("role") == "system":
@@ -142,16 +178,17 @@ class LiteLLMProvider(LLMProvider):
                 new_messages.append({**msg, "content": new_content})
             else:
                 new_messages.append(msg)
-
         new_tools = tools
         if tools:
             new_tools = list(tools)
             new_tools[-1] = {**new_tools[-1], "cache_control": {"type": "ephemeral"}}
-
         return new_messages, new_tools
 
+    # ------------------------------------------------------------------
+    # Model overrides and message sanitization
+    # ------------------------------------------------------------------
+
     def _apply_model_overrides(self, model: str, kwargs: dict[str, Any]) -> None:
-        """Apply model-specific parameter overrides from the registry."""
         model_lower = model.lower()
         spec = find_by_model(model)
         if spec:
@@ -162,9 +199,12 @@ class LiteLLMProvider(LLMProvider):
 
     @staticmethod
     def _extra_msg_keys(original_model: str, resolved_model: str) -> frozenset[str]:
-        """Return provider-specific extra keys to preserve in request messages."""
         spec = find_by_model(original_model) or find_by_model(resolved_model)
-        if (spec and spec.name == "anthropic") or "claude" in original_model.lower() or resolved_model.startswith("anthropic/"):
+        if (
+            (spec and spec.name == "anthropic")
+            or "claude" in original_model.lower()
+            or resolved_model.startswith("anthropic/")
+        ):
             return _ANTHROPIC_EXTRA_KEYS
         return frozenset()
 
@@ -178,7 +218,9 @@ class LiteLLMProvider(LLMProvider):
         return hashlib.sha1(tool_call_id.encode()).hexdigest()[:9]
 
     @staticmethod
-    def _sanitize_messages(messages: list[dict[str, Any]], extra_keys: frozenset[str] = frozenset()) -> list[dict[str, Any]]:
+    def _sanitize_messages(
+        messages: list[dict[str, Any]], extra_keys: frozenset[str] = frozenset()
+    ) -> list[dict[str, Any]]:
         """Strip non-standard keys and ensure assistant messages have a content key."""
         allowed = _ALLOWED_MSG_KEYS | extra_keys
         sanitized = LLMProvider._sanitize_request_messages(messages, allowed)
@@ -202,10 +244,13 @@ class LiteLLMProvider(LLMProvider):
                     tc_clean["id"] = map_id(tc_clean.get("id"))
                     normalized_tool_calls.append(tc_clean)
                 clean["tool_calls"] = normalized_tool_calls
-
             if "tool_call_id" in clean and clean["tool_call_id"]:
                 clean["tool_call_id"] = map_id(clean["tool_call_id"])
         return sanitized
+
+    # ------------------------------------------------------------------
+    # Chat dispatch
+    # ------------------------------------------------------------------
 
     async def chat(
         self,
@@ -217,62 +262,117 @@ class LiteLLMProvider(LLMProvider):
         reasoning_effort: str | None = None,
         tool_choice: str | dict[str, Any] | None = None,
     ) -> LLMResponse:
-        """
-        Send a chat completion request via LiteLLM.
+        if self._use_litellm:
+            return await self._chat_litellm(
+                messages, tools, model, max_tokens, temperature, reasoning_effort, tool_choice
+            )
+        return await self._chat_openai(
+            messages, tools, model, max_tokens, temperature, reasoning_effort, tool_choice
+        )
 
-        Args:
-            messages: List of message dicts with 'role' and 'content'.
-            tools: Optional list of tool definitions in OpenAI format.
-            model: Model identifier (e.g., 'anthropic/claude-sonnet-4-5').
-            max_tokens: Maximum tokens in response.
-            temperature: Sampling temperature.
-
-        Returns:
-            LLMResponse with content and/or tool calls.
-        """
+    async def _chat_openai(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+        model: str | None,
+        max_tokens: int,
+        temperature: float,
+        reasoning_effort: str | None,
+        tool_choice: str | dict[str, Any] | None,
+    ) -> LLMResponse:
         original_model = model or self.default_model
-        model = self._resolve_model(original_model)
-        extra_msg_keys = self._extra_msg_keys(original_model, model)
+        extra_msg_keys = self._extra_msg_keys(original_model, original_model)
 
         if self._supports_cache_control(original_model):
             messages, tools = self._apply_cache_control(messages, tools)
 
-        # Clamp max_tokens to at least 1 — negative or zero values cause
-        # LiteLLM to reject the request with "max_tokens must be at least 1".
-        max_tokens = max(1, max_tokens)
-
         kwargs: dict[str, Any] = {
-            "model": model,
-            "messages": self._sanitize_messages(self._sanitize_empty_content(messages), extra_keys=extra_msg_keys),
-            "max_tokens": max_tokens,
+            "model": original_model,
+            "messages": self._sanitize_messages(
+                self._sanitize_empty_content(messages), extra_keys=extra_msg_keys
+            ),
+            "max_tokens": max(1, max_tokens),
             "temperature": temperature,
         }
 
-        if self._gateway:
-            kwargs.update(self._gateway.litellm_kwargs)
+        self._apply_model_overrides(original_model, kwargs)
 
-        # Apply model-specific overrides (e.g. kimi-k2.5 temperature)
-        self._apply_model_overrides(model, kwargs)
+        # Ollama requires num_ctx to pre-allocate the KV cache; without it the
+        # server defaults to 2048 and silently truncates or returns an empty body.
+        extra_body: dict[str, Any] = {}
+        if self._is_ollama and self.context_window_tokens:
+            extra_body["num_ctx"] = self.context_window_tokens
+            extra_body["think"] = False  # disable built-in thinking mode (Qwen3 etc.)
+        if extra_body:
+            kwargs["extra_body"] = extra_body
 
-        if self._langsmith_enabled:
+        if tools:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = tool_choice or "auto"
+
+        if reasoning_effort:
+            kwargs["reasoning_effort"] = reasoning_effort
+
+        try:
+            response = await self._openai_client.chat.completions.create(**kwargs)
+            return self._parse_response(response)
+        except Exception as e:
+            return LLMResponse(content=f"Error calling LLM: {str(e)}", finish_reason="error")
+
+    async def _chat_litellm(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None,
+        model: str | None,
+        max_tokens: int,
+        temperature: float,
+        reasoning_effort: str | None,
+        tool_choice: str | dict[str, Any] | None,
+    ) -> LLMResponse:
+        import litellm  # noqa: PLC0415
+        from litellm import acompletion  # noqa: PLC0415
+
+        litellm.suppress_debug_info = True
+        litellm.drop_params = True
+
+        original_model = model or self.default_model
+        resolved = self._resolve_model(original_model)
+        extra_msg_keys = self._extra_msg_keys(original_model, resolved)
+
+        if self._supports_cache_control(original_model):
+            messages, tools = self._apply_cache_control(messages, tools)
+
+        kwargs: dict[str, Any] = {
+            "model": resolved,
+            "messages": self._sanitize_messages(
+                self._sanitize_empty_content(messages), extra_keys=extra_msg_keys
+            ),
+            "max_tokens": max(1, max_tokens),
+            "temperature": temperature,
+        }
+
+        spec = self._gateway or (find_by_name(self._provider_name) if self._provider_name else None)
+        if spec and spec.litellm_kwargs:
+            kwargs.update(spec.litellm_kwargs)
+        if spec and spec.name == "ollama" and self.context_window_tokens:
+            kwargs["num_ctx"] = self.context_window_tokens
+
+        self._apply_model_overrides(resolved, kwargs)
+
+        if getattr(self, "_langsmith_enabled", False):
             kwargs.setdefault("callbacks", []).append("langsmith")
 
-        # Pass api_key directly — more reliable than env vars alone
         if self.api_key:
             kwargs["api_key"] = self.api_key
-
-        # Pass api_base for custom endpoints
         if self.api_base:
             kwargs["api_base"] = self.api_base
-
-        # Pass extra headers (e.g. APP-Code for AiHubMix)
         if self.extra_headers:
             kwargs["extra_headers"] = self.extra_headers
-        
+        if self.request_timeout is not None:
+            kwargs["timeout"] = self.request_timeout
         if reasoning_effort:
             kwargs["reasoning_effort"] = reasoning_effort
             kwargs["drop_params"] = True
-        
         if tools:
             kwargs["tools"] = tools
             kwargs["tool_choice"] = tool_choice or "auto"
@@ -281,14 +381,13 @@ class LiteLLMProvider(LLMProvider):
             response = await acompletion(**kwargs)
             return self._parse_response(response)
         except Exception as e:
-            # Return error as content for graceful handling
-            return LLMResponse(
-                content=f"Error calling LLM: {str(e)}",
-                finish_reason="error",
-            )
+            return LLMResponse(content=f"Error calling LLM: {str(e)}", finish_reason="error")
+
+    # ------------------------------------------------------------------
+    # Response parsing (identical for both SDK paths — same attribute names)
+    # ------------------------------------------------------------------
 
     def _parse_response(self, response: Any) -> LLMResponse:
-        """Parse LiteLLM response into our standard format."""
         choice = response.choices[0]
         message = choice.message
         content = message.content
@@ -307,12 +406,14 @@ class LiteLLMProvider(LLMProvider):
                 content = msg.content
 
         if len(response.choices) > 1:
-            logger.debug("LiteLLM response has {} choices, merged {} tool_calls",
-                         len(response.choices), len(raw_tool_calls))
+            logger.debug(
+                "response has {} choices, merged {} tool_calls",
+                len(response.choices),
+                len(raw_tool_calls),
+            )
 
         tool_calls = []
         for tc in raw_tool_calls:
-            # Parse arguments from JSON string if needed
             args = tc.function.arguments
             if isinstance(args, str):
                 args = json_repair.loads(args)
@@ -322,13 +423,15 @@ class LiteLLMProvider(LLMProvider):
                 getattr(tc.function, "provider_specific_fields", None) or None
             )
 
-            tool_calls.append(ToolCallRequest(
-                id=_short_tool_id(),
-                name=tc.function.name,
-                arguments=args,
-                provider_specific_fields=provider_specific_fields,
-                function_provider_specific_fields=function_provider_specific_fields,
-            ))
+            tool_calls.append(
+                ToolCallRequest(
+                    id=_short_tool_id(),
+                    name=tc.function.name,
+                    arguments=args,
+                    provider_specific_fields=provider_specific_fields,
+                    function_provider_specific_fields=function_provider_specific_fields,
+                )
+            )
 
         usage = {}
         if hasattr(response, "usage") and response.usage:
@@ -351,5 +454,4 @@ class LiteLLMProvider(LLMProvider):
         )
 
     def get_default_model(self) -> str:
-        """Get the default model."""
         return self.default_model

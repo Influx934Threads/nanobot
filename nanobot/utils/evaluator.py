@@ -55,6 +55,8 @@ async def evaluate_response(
     task_context: str,
     provider: LLMProvider,
     model: str,
+    fast_provider: "LLMProvider | None" = None,
+    fast_model: str | None = None,
 ) -> bool:
     """Decide whether a background-task result should be delivered to the user.
 
@@ -63,7 +65,9 @@ async def evaluate_response(
     that important messages are never silently dropped.
     """
     try:
-        llm_response = await provider.chat_with_retry(
+        eval_provider = fast_provider or provider
+        eval_model = fast_model or model
+        llm_response = await eval_provider.chat_with_retry(
             messages=[
                 {"role": "system", "content": _SYSTEM_PROMPT},
                 {"role": "user", "content": (
@@ -72,7 +76,7 @@ async def evaluate_response(
                 )},
             ],
             tools=_EVALUATE_TOOL,
-            model=model,
+            model=eval_model,
             max_tokens=256,
             temperature=0.0,
         )

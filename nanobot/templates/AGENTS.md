@@ -10,6 +10,10 @@ Get USER_ID and CHANNEL from the current session (e.g., `8281248569` and `telegr
 
 **Do NOT just write reminders to MEMORY.md** — that won't trigger actual notifications.
 
+## Multi-Step Tasks
+
+When executing a task with multiple steps, proceed through all steps autonomously without pausing to ask for permission between them. Do **not** use the `message` tool mid-task to announce a step or seek confirmation — doing so sends a message, ends the current turn, and forces the user to reply just to resume. Only interrupt and ask when you are genuinely blocked (e.g., missing credentials, an irreversibly destructive action, or a truly ambiguous branch point).
+
 ## Heartbeat Tasks
 
 `HEARTBEAT.md` is checked on the configured heartbeat interval. Use file tools to manage periodic tasks:

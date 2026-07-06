@@ -227,7 +227,7 @@ class EditFileTool(_FsTool):
                 "old_text": {"type": "string", "description": "The text to find and replace"},
                 "new_text": {"type": "string", "description": "The text to replace with"},
                 "replace_all": {
-                    "type": "boolean",
+                    "type": ["boolean", "string"],
                     "description": "Replace all occurrences (default false)",
                 },
             },
@@ -236,8 +236,10 @@ class EditFileTool(_FsTool):
 
     async def execute(
         self, path: str, old_text: str, new_text: str,
-        replace_all: bool = False, **kwargs: Any,
+        replace_all: bool | str = False, **kwargs: Any,
     ) -> str:
+        if isinstance(replace_all, str):
+            replace_all = replace_all.lower() in ("true", "1", "yes")
         try:
             fp = self._resolve(path)
             if not fp.exists():
@@ -324,7 +326,7 @@ class ListDirTool(_FsTool):
             "properties": {
                 "path": {"type": "string", "description": "The directory path to list"},
                 "recursive": {
-                    "type": "boolean",
+                    "type": ["boolean", "string"],
                     "description": "Recursively list all files (default false)",
                 },
                 "max_entries": {
@@ -337,9 +339,11 @@ class ListDirTool(_FsTool):
         }
 
     async def execute(
-        self, path: str, recursive: bool = False,
+        self, path: str, recursive: bool | str = False,
         max_entries: int | None = None, **kwargs: Any,
     ) -> str:
+        if isinstance(recursive, str):
+            recursive = recursive.lower() in ("true", "1", "yes")
         try:
             dp = self._resolve(path)
             if not dp.exists():

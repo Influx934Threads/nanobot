@@ -64,12 +64,16 @@ class AgentLoop:
         session_manager: SessionManager | None = None,
         mcp_servers: dict | None = None,
         channels_config: ChannelsConfig | None = None,
+        fast_provider: LLMProvider | None = None,
+        fast_model: str | None = None,
     ):
         from nanobot.config.schema import ExecToolConfig, WebSearchConfig
 
         self.bus = bus
         self.channels_config = channels_config
         self.provider = provider
+        self.fast_provider = fast_provider
+        self.fast_model = fast_model or (fast_provider.get_default_model() if fast_provider else None)
         self.workspace = workspace
         self.model = model or provider.get_default_model()
         self.max_iterations = max_iterations
@@ -169,6 +173,47 @@ class AgentLoop:
             return None
         return re.sub(r"<think>[\s\S]*?</think>", "", text).strip() or None
 
+    # Keywords that indicate a background task needs real work, not just a status check.
+    # Presence of any of these routes the task to the heavy model.
+    _BACKGROUND_HEAVY_KEYWORDS = frozenset({
+        "download", "sync", "scrape", "collect",
+        "send", "email",
+        "deploy", "install", "execute", "run",
+        "analyze", "analyse", "summarize", "summarise", "research",
+        "implement", "develop", "debug", "refactor",
+        "generate", "create", "build", "write", "update",
+        "code",
+    })
+
+    @classmethod
+    def _is_heavy_background_task(cls, text: str) -> bool:
+        """Return True when a background task description requires the heavy model."""
+        words = set(re.split(r"\W+", text.lower()))
+        return bool(words & cls._BACKGROUND_HEAVY_KEYWORDS)
+
+    @staticmethod
+    def _trim_history_by_tokens(history: list[dict], max_tokens: int) -> list[dict]:
+        """Return the most recent messages from history that fit within max_tokens.
+
+        Trims from the front, then advances to the first user message so the
+        remaining slice starts at a clean turn boundary.
+        """
+        from nanobot.utils.helpers import estimate_message_tokens
+        total = 0
+        cut = 0
+        for i in range(len(history) - 1, -1, -1):
+            total += estimate_message_tokens(history[i])
+            if total > max_tokens:
+                cut = i + 1
+                break
+        else:
+            return history
+        trimmed = history[cut:]
+        for i, msg in enumerate(trimmed):
+            if msg.get("role") == "user":
+                return trimmed[i:]
+        return trimmed
+
     @staticmethod
     def _tool_hint(tool_calls: list) -> str:
         """Format tool calls as concise hint, e.g. 'web_search("query")'."""
@@ -184,8 +229,12 @@ class AgentLoop:
         self,
         initial_messages: list[dict],
         on_progress: Callable[..., Awaitable[None]] | None = None,
+        provider: LLMProvider | None = None,
+        model: str | None = None,
     ) -> tuple[str | None, list[str], list[dict]]:
         """Run the agent iteration loop."""
+        active_provider = provider or self.provider
+        active_model = model or self.model
         messages = initial_messages
         iteration = 0
         final_content = None
@@ -196,10 +245,10 @@ class AgentLoop:
 
             tool_defs = self.tools.get_definitions()
 
-            response = await self.provider.chat_with_retry(
+            response = await active_provider.chat_with_retry(
                 messages=messages,
                 tools=tool_defs,
-                model=self.model,
+                model=active_model,
             )
 
             if response.has_tool_calls:
@@ -235,7 +284,7 @@ class AgentLoop:
                 # poison the context and cause permanent 400 loops (#1303).
                 if response.finish_reason == "error":
                     logger.error("LLM returned error: {}", (clean or "")[:200])
-                    final_content = clean or "Sorry, I encountered an error calling the AI model."
+                    final_content = "Sorry, I encountered an error calling the AI model."
                     break
                 messages = self.context.add_assistant_message(
                     messages, clean, reasoning_content=response.reasoning_content,
@@ -358,6 +407,7 @@ class AgentLoop:
         msg: InboundMessage,
         session_key: str | None = None,
         on_progress: Callable[[str], Awaitable[None]] | None = None,
+        is_background: bool = False,
     ) -> OutboundMessage | None:
         """Process a single inbound message and return the response."""
         # System messages: parse origin from chat_id ("channel:chat_id")
@@ -376,6 +426,7 @@ class AgentLoop:
                 history=history,
                 current_message=msg.content, channel=channel, chat_id=chat_id,
                 current_role=current_role,
+                model=self.provider.active_model,
             )
             final_content, _, all_msgs = await self._run_agent_loop(messages)
             self._save_turn(session, all_msgs, 1 + len(history))
@@ -421,12 +472,21 @@ class AgentLoop:
             if isinstance(message_tool, MessageTool):
                 message_tool.start_turn()
 
+        if is_background and self.fast_provider and not self._is_heavy_background_task(msg.content):
+            routed_provider = self.fast_provider
+            routed_model = self.fast_model
+            logger.debug("Background task routed to fast provider: {}", routed_model)
+        else:
+            routed_provider = self.provider
+            routed_model = self.model
+
         history = session.get_history(max_messages=0)
         initial_messages = self.context.build_messages(
             history=history,
             current_message=msg.content,
             media=msg.media if msg.media else None,
             channel=msg.channel, chat_id=msg.chat_id,
+            model=routed_provider.active_model,
         )
 
         async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
@@ -438,11 +498,20 @@ class AgentLoop:
             ))
 
         final_content, _, all_msgs = await self._run_agent_loop(
-            initial_messages, on_progress=on_progress or _bus_progress,
+            initial_messages,
+            on_progress=on_progress or _bus_progress,
+            provider=routed_provider,
+            model=routed_model,
         )
 
         if final_content is None:
-            final_content = "I've completed processing but have no response to give."
+            logger.warning("Empty final response from LLM, sending recovery prompt")
+            recovery_msgs = all_msgs + [{
+                "role": "user",
+                "content": "Please provide a brief text summary of what you just completed.",
+            }]
+            recovery = await routed_provider.chat_with_retry(messages=recovery_msgs, tools=None)
+            final_content = self._strip_think(recovery.content) or "Task completed (no summary available)."
 
         self._save_turn(session, all_msgs, 1 + len(history))
         self.sessions.save(session)
@@ -502,9 +571,12 @@ class AgentLoop:
         channel: str = "cli",
         chat_id: str = "direct",
         on_progress: Callable[[str], Awaitable[None]] | None = None,
+        is_background: bool = False,
     ) -> str:
         """Process a message directly (for CLI or cron usage)."""
         await self._connect_mcp()
         msg = InboundMessage(channel=channel, sender_id="user", chat_id=chat_id, content=content)
-        response = await self._process_message(msg, session_key=session_key, on_progress=on_progress)
+        response = await self._process_message(
+            msg, session_key=session_key, on_progress=on_progress, is_background=is_background,
+        )
         return response.content if response else ""

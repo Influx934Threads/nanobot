@@ -19,9 +19,11 @@ class CustomProvider(LLMProvider):
         api_base: str = "http://localhost:8000/v1",
         default_model: str = "default",
         extra_headers: dict[str, str] | None = None,
+        request_timeout: float | None = None,
     ):
         super().__init__(api_key, api_base)
         self.default_model = default_model
+        self.request_timeout = request_timeout
         # Keep affinity stable for this provider instance to improve backend cache locality,
         # while still letting users attach provider-specific headers for custom gateways.
         default_headers = {
@@ -32,6 +34,7 @@ class CustomProvider(LLMProvider):
             api_key=api_key,
             base_url=api_base,
             default_headers=default_headers,
+            timeout=request_timeout,
         )
 
     async def chat(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]] | None = None,
