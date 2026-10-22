@@ -1,0 +1,38 @@
+{
+  "enabled": true,
+  "auto_apply": true,
+  "description": "Privacy filter automatically applied to all interactions",
+  "patterns": {
+    "telegram_user": {
+      "pattern": "@\\w+",
+      "replacement": "[TELEGRAM_USER]",
+      "enabled": true
+    },
+    "chat_id": {
+      "pattern": "(?<![\\w\\-])(\\d{8,13})(?![\\w\\-])",
+      "replacement": "[CHAT_ID]",
+      "enabled": true
+    },
+    "email": {
+      "pattern": "[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}",
+      "replacement": "[EMAIL]",
+      "enabled": true
+    },
+    "ip_address": {
+      "pattern": "\\b(?:(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\\.){3}(?:25[0-5]|2[0-4][0-9]|[01]?[0-9][0-9]?)\\b",
+      "replacement": "[IP_ADDRESS]",
+      "enabled": true
+    },
+    "bearer_token": {
+      "pattern": "Bearer\\s+[A-Za-z0-9\\-_]+\\.[A-Za-z0-9\\-_]+\\.[A-Za-z0-9\\-_]*",
+      "replacement": "[BEARER_TOKEN]",
+      "enabled": true
+    },
+    "api_key_generic": {
+      "pattern": "sk-[a-zA-Z0-9]{20,}",
+      "replacement": "[API_KEY]",
+      "enabled": true
+    }
+  },
+  "last_updated": "2026-03-21T17:37:00+01:00"
+}

@@ -1,0 +1,61 @@
+{
+  "version": 1,
+  "jobs": [
+    {
+      "id": "01dba649",
+      "name": "Generate DSPM weekly digest: R",
+      "enabled": false,
+      "schedule": {
+        "kind": "cron",
+        "atMs": null,
+        "everyMs": null,
+        "expr": "0 9 * * 1",
+        "tz": "Europe/Berlin"
+      },
+      "payload": {
+        "kind": "agent_turn",
+        "message": "Generate DSPM weekly digest: Run the full digest pipeline - generate markdown digest for past 7 days, save to /home/anshin/.nanobot/workspace/weekly_digests/dspm_weekly_digest_YYYY-MM-DD.md, send email to ciberjos@gmail.com with markdown attachment.",
+        "deliver": true,
+        "channel": "telegram",
+        "to": "6820175335"
+      },
+      "state": {
+        "nextRunAtMs": 1783321200000,
+        "lastRunAtMs": 1782716400010,
+        "lastStatus": "ok",
+        "lastError": null
+      },
+      "createdAtMs": 1778439216603,
+      "updatedAtMs": 1782716692349,
+      "deleteAfterRun": false
+    },
+    {
+      "id": "7529ffc3",
+      "name": "Generate DSPM monthly digest: ",
+      "enabled": false,
+      "schedule": {
+        "kind": "cron",
+        "atMs": null,
+        "everyMs": null,
+        "expr": "0 9 1 * *",
+        "tz": "Europe/Berlin"
+      },
+      "payload": {
+        "kind": "agent_turn",
+        "message": "Generate DSPM monthly digest: Run the full digest pipeline - generate markdown digest for past 30 days, save to /home/anshin/.nanobot/workspace/monthly_digests/dspm_monthly_digest_YYYY-MM.md, send email to ciberjos@gmail.com with markdown attachment.",
+        "deliver": true,
+        "channel": "telegram",
+        "to": "6820175335"
+      },
+      "state": {
+        "nextRunAtMs": 1785567600000,
+        "lastRunAtMs": 1782889200010,
+        "lastStatus": "ok",
+        "lastError": null
+      },
+      "createdAtMs": 1778439216614,
+      "updatedAtMs": 1782890105599,
+      "deleteAfterRun": false
+    }
+  ]
+}
