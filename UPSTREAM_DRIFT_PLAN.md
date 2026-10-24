@@ -258,3 +258,7 @@ All checks run against the real `~/.nanobot/config.json` and `~/.nanobot/workspa
 Tagged `cutover-2026-10-24` (alongside the existing Phase 0 safety tag `pre-upgrade-2026-10-22`, both on `local-patches`' lineage — rollback is `git checkout local-patches && systemctl --user restart nanobot` plus restoring `config.json.bak-20261024-pre-migration`).
 
 **Still open**: the monthly re-diff-against-origin/main cadence decided in §7 — not yet set up as an actual recurring mechanism (reminder, cron job, or calendar note). Next action, not yet taken.
+
+**Monthly sync cadence — now set up**: created a real, session-bound nanobot cron job (`2908f022`, "Monthly nanobot upstream-drift check"), firing `0 9 1 * *` Europe/Madrid (1st of each month, 09:00). Bound to the Telegram session (`telegram:6820175335`, matching the real existing session pattern used by the legacy DSPM jobs) so the report lands there automatically, and the task instructs the agent to also email a copy to `ciberjos@gmail.com` via its own message tool. Task: `git fetch origin` + count commits past the fork point + skim the latest upstream log for anything security-relevant, with `UPSTREAM_DRIFT_PLAN.md` as context. Written directly into the real cron store (`~/.nanobot/workspace/cron/jobs.json`, now 5 jobs) — confirmed the live `CronService` reloads its store from disk on every tick (by design, to merge concurrent writers), so no gateway restart was needed for this job to go live.
+
+All four phases of this plan are now complete.
