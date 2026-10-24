@@ -830,7 +830,11 @@ class LLMProvider(ABC):
         if kind in cls._TRANSIENT_ERROR_KINDS:
             return True
 
-        return cls._is_transient_error(response.content)
+        # Cold-start errors are a form of transient error — the backend
+        # will recover, it just needs the longer _COLD_START_RETRY_DELAYS
+        # pace (applied separately in _run_with_retry) rather than the
+        # default one.
+        return cls._is_transient_error(response.content) or cls._is_cold_start_error(response.content)
 
     @classmethod
     def is_arrearage_response(cls, response: LLMResponse) -> bool:
