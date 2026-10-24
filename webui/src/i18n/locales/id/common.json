@@ -1787,7 +1787,6 @@
       "progress": "{{completed}} dari {{total}} selesai",
       "running": "Berjalan: {{count}}",
       "finished": "Berakhir: {{count}}",
-      "active": "Aktif: {{count}}",
       "completed": "Selesai: {{count}}",
       "needsReview": "Perlu diperiksa: {{count}}",
       "messages": "Status pesan"
