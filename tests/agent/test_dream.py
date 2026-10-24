@@ -429,6 +429,62 @@ class TestEphemeralDirect:
         assert loop.model == "test-model"
         assert loop.model_preset is None
 
+    def test_fast_runtime_uses_preset_without_changing_default(self, _make_loop):
+        loop, _ = _make_loop
+        loop.runtime_resolver._model_presets = {
+            "fast": ModelPresetConfig(model="fast-model"),
+        }
+        loop.fast_model_preset = "fast"
+
+        runtime = loop.fast_runtime()
+
+        assert runtime is not None
+        assert runtime.model == "fast-model"
+        assert runtime.model_preset == "fast"
+        assert loop.model == "test-model"
+        assert loop.model_preset is None
+
+    def test_fast_runtime_is_none_without_a_configured_preset(self, _make_loop):
+        loop, _ = _make_loop
+        assert loop.fast_model_preset is None
+        assert loop.fast_runtime() is None
+
+    @pytest.mark.parametrize(
+        ("text", "expected"),
+        [
+            ("Check the weather and summarize it for the morning digest", True),
+            ("Send the daily report email to the team", True),
+            ("Remind me that the dentist appointment is at 3pm", False),
+            ("Read HEARTBEAT.md and report what's due", False),
+        ],
+        ids=["summarize", "send-email", "reminder", "heartbeat-read"],
+    )
+    def test_is_heavy_background_task_matches_consequential_keywords(self, text, expected):
+        from nanobot.agent.loop import AgentLoop
+
+        assert AgentLoop._is_heavy_background_task(text) is expected
+
+    def test_background_runtime_skips_fast_preset_for_heavy_tasks(self, _make_loop):
+        loop, _ = _make_loop
+        loop.runtime_resolver._model_presets = {
+            "fast": ModelPresetConfig(model="fast-model"),
+        }
+        loop.fast_model_preset = "fast"
+
+        assert loop.background_runtime("Please send the weekly summary email") is None
+
+    def test_background_runtime_uses_fast_preset_for_routine_tasks(self, _make_loop):
+        loop, _ = _make_loop
+        loop.runtime_resolver._model_presets = {
+            "fast": ModelPresetConfig(model="fast-model"),
+        }
+        loop.fast_model_preset = "fast"
+
+        runtime = loop.background_runtime("Check if the dentist reminder is still due today")
+
+        assert runtime is not None
+        assert runtime.model == "fast-model"
+
     async def test_ephemeral_skips_raw_archive(self, tmp_path, _make_loop):
         """When ephemeral=True, raw_archive must not be called."""
         from unittest.mock import patch
@@ -548,6 +604,21 @@ class TestEphemeralDirect:
         assert resp is not None
         assert resp.metadata["_stop_reason"] == "error"
         assert MemoryStore.dream_run_completed(resp) is False
+
+    async def test_non_ephemeral_response_also_reports_stop_reason(self, tmp_path, _make_loop):
+        """Non-ephemeral turns get ``_stop_reason`` too, so callers like the
+        heartbeat background-task escalation can detect a run that didn't
+        really finish without the turn being ephemeral."""
+        loop, store = _make_loop
+        loop.provider.chat_stream_with_retry.return_value = LLMResponse(
+            content="provider error",
+            finish_reason="error",
+        )
+
+        resp = await loop.process_direct("test", session_key="cli:normal")
+
+        assert resp is not None
+        assert resp.metadata["_stop_reason"] == "error"
 
     async def test_completed_response_after_tool_error_is_success(self, _make_loop):
         """A soft tool error is model input, not a second run-level failure state."""

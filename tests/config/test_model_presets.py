@@ -367,6 +367,24 @@ def test_validator_rejects_unknown_dream_model_preset() -> None:
         })
 
 
+def test_validator_accepts_fast_model_preset() -> None:
+    config = Config.model_validate({
+        "modelPresets": {
+            "fast": {"model": "anthropic/claude-haiku-4-5", "provider": "anthropic"},
+        },
+        "agents": {"defaults": {"fast_model_preset": "fast"}},
+    })
+
+    assert config.agents.defaults.fast_model_preset == "fast"
+
+
+def test_validator_rejects_unknown_fast_model_preset() -> None:
+    with pytest.raises(ValueError, match="fast_model_preset 'unknown' not found"):
+        Config.model_validate({
+            "agents": {"defaults": {"fast_model_preset": "unknown"}},
+        })
+
+
 def test_model_preset_accepts_explicit_default_name() -> None:
     config = Config.model_validate({
         "agents": {
