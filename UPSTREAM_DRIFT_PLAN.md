@@ -162,9 +162,11 @@ Upstream's `ProviderConfig` already has `timeout: float = 120.0` natively. **Ver
 
 This was a LiteLLM-specific passthrough kwarg, and the whole `litellm_kwargs` mechanism dies with `litellm_provider.py` (see the big finding above). Upstream has a *different*, more general mechanism for thinking-model output (`extract_thinking_blocks` per-provider-spec in `registry.py`, `thinking_enabled` on the Anthropic provider) — but I did not find a direct "suppress Qwen3's chain-of-thought preamble" equivalent. **Verdict: (c) — the goal (don't pay for/show Qwen3's thinking preamble when not wanted) is still real, but the mechanism must be translated to upstream's new thinking-content model, not ported as-is. Needs a decision during Phase 2 on which of upstream's knobs actually achieves the same practical effect.**
 
-### Memory consolidation threshold (`agent/memory.py`, 2 lines) — (b)
+### Memory consolidation threshold (`agent/memory.py`, 2 lines) — (a), decided 2026-10-24 during Phase 2
 
-Trivial, standalone: trigger token-based consolidation at 80% of the context window instead of 100%, for safety margin. Low risk, easy to re-apply wherever this logic now lives. **Verdict: (b).**
+Originally assumed trivial (2 lines, "trigger at 80% of context window instead of 100%"). Turned out not to be: the mechanism it tuned is **gone**. Checked `agent/autocompact.py` on current `origin/main` — the whole idle-consolidation strategy has been replaced: it now triggers purely on **session idle time** (`session_ttl_minutes` — "quiet for N minutes"), not context-window token size at all. Searched the entire codebase for any surviving percentage-of-context-window compaction trigger (`0.7–0.9 * context_window` patterns) — none exists anywhere. There is nothing left to apply an "80% not 100%" tweak *to*.
+
+**Verdict: (a) — drop.** Not "upstream covers it," but the closest real finding here: diff size doesn't predict porting difficulty — a 2-line patch can hinge on an entire strategy that moved, same as a 90-line one can turn out to be a clean drop-in. Inventing a new time-based "safety margin" concept to replicate the old *intent* under the new idle-time model would be solving a problem nobody's reported having since the migration — not worth the invented complexity.
 
 ### Runtime-context model tag (`agent/context.py`, 11 lines) — (b, tied to the fallback decision)
 
