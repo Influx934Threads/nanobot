@@ -200,3 +200,14 @@ Of the local patch's 1,394 changed lines: **~460 collapse to (a)** (fallback cha
 6. ~~Sync cadence for Phase 4~~ — **decided: monthly** (2026-10-24).
 
 All open decisions closed. Proceeding to Phase 2 (2026-10-24).
+
+## 8. Phase 2 progress log (2026-10-24)
+
+Branch `upstream-rebuild`, forked from `origin/main` at `3c022ad` (today).
+
+**Infrastructure finding, before any porting**: the editable install itself was also stale — `rapidfuzz` (a real declared dependency in current `pyproject.toml`) had never been installed, so none of upstream's current test suite could even run. `pip install -e . --break-system-packages` (matching the system's existing externally-managed-environment install method, not a new pattern) brought the package from `0.1.4.post5` to `0.3.5` and fixed it — `tests/tools/test_filesystem_tools.py` went from an import error to 51/51 passing. **Confirmed safe**: the live `nanobot.service` process (PID running continuously since 2026-09-19) has the old code loaded in memory already; an editable install's on-disk branch/package changes only take effect on the next restart, which hasn't happened. No production disruption from this work so far.
+
+Ported so far, each verified before moving on:
+- **Memory consolidation threshold — dropped**, see §6 (mechanism it tuned no longer exists).
+- **`templates/AGENTS.md` "Multi-Step Tasks" instruction** — clean port, inserted after "Workspace Guidance" and before the current "Scheduled Reminders" section (the file's structure grew a section in between, but the insertion point concept — right after the general guidance intro — still applies). Verified no test asserts the template's literal content.
+- **String-boolean tool-arg coercion** (`EditFileTool.replace_all`, `ListDirTool.recursive`) — clean port, same fix, same two call sites still exist under the same names. One adaptation: the JSON schema declared to the model stays `BooleanSchema` (boolean-only) rather than the old patch's `["boolean", "string"]` — upstream's typed schema class has no multi-type option, and the runtime coercion is what actually matters (it's defensive against a model ignoring the schema anyway, which is the original failure mode). `tests/tools/test_filesystem_tools.py`: 51/51 passing after the change.

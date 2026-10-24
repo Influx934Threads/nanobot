@@ -920,9 +920,13 @@ class EditFileTool(_FsTool):
     async def execute(
         self, path: str | None = None, old_text: str | None = None,
         new_text: str | None = None,
-        replace_all: bool = False, occurrence: int | None = None,
+        replace_all: bool | str = False, occurrence: int | None = None,
         line_hint: int | None = None, expected_replacements: int | None = None, **kwargs: Any,
     ) -> str:
+        # Some models emit "true"/"false" as a JSON string rather than a
+        # boolean literal in tool-call arguments — coerce defensively.
+        if isinstance(replace_all, str):
+            replace_all = replace_all.lower() in ("true", "1", "yes")
         try:
             if not path:
                 raise ValueError("Unknown path")
@@ -1153,9 +1157,13 @@ class ListDirTool(_FsTool):
         return True
 
     async def execute(
-        self, path: str | None = None, recursive: bool = False,
+        self, path: str | None = None, recursive: bool | str = False,
         max_entries: int | None = None, **kwargs: Any,
     ) -> str:
+        # Some models emit "true"/"false" as a JSON string rather than a
+        # boolean literal in tool-call arguments — coerce defensively.
+        if isinstance(recursive, str):
+            recursive = recursive.lower() in ("true", "1", "yes")
         try:
             if path is None:
                 raise ValueError("Unknown path")
