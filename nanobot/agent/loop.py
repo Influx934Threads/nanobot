@@ -7,6 +7,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import os
+import re
 import time
 import weakref
 from collections.abc import Coroutine, Iterable, Mapping
@@ -274,6 +275,35 @@ class AgentLoop:
             return None
         return self.runtime_resolver.resolve_preset(self.dream_model_preset)
 
+    def fast_runtime(self) -> LLMRuntime | None:
+        """Resolve the optional preset used for routine background tasks (cron/heartbeat)."""
+        if not self.fast_model_preset:
+            return None
+        return self.runtime_resolver.resolve_preset(self.fast_model_preset)
+
+    # Keywords that mark a background task as too consequential for the fast
+    # preset — these route through the full default model instead.
+    _BACKGROUND_HEAVY_KEYWORDS = frozenset({
+        "send", "email",
+        "deploy", "install", "execute", "run",
+        "analyze", "analyse", "summarize", "summarise", "research",
+        "implement", "develop", "debug", "refactor",
+        "generate", "create", "build", "write", "update",
+        "code",
+    })
+
+    @classmethod
+    def _is_heavy_background_task(cls, text: str) -> bool:
+        """Return True when a background task description requires the heavy model."""
+        words = set(re.split(r"\W+", text.lower()))
+        return bool(words & cls._BACKGROUND_HEAVY_KEYWORDS)
+
+    def background_runtime(self, task_text: str) -> LLMRuntime | None:
+        """Resolve the fast preset for a background task, unless it looks heavy."""
+        if self._is_heavy_background_task(task_text):
+            return None
+        return self.fast_runtime()
+
     _RUNTIME_CHECKPOINT_KEY = "runtime_checkpoint"
     _PENDING_USER_TURN_KEY = "pending_user_turn"
     _PROVIDER_STATE_CHECKPOINT_VERSION_KEY = "provider_state_checkpoint_version"
@@ -310,6 +340,7 @@ class AgentLoop:
         preset_catalog_loader: preset_helpers.PresetCatalogLoader | None = None,
         model_preset: str | None = None,
         dream_model_preset: str | None = None,
+        fast_model_preset: str | None = None,
         preset_snapshot_loader: preset_helpers.PresetSnapshotLoader | None = None,
         turn_delivery_factory: TurnDeliveryFactory | None = None,
         runtime_model_publisher: Callable[[str, str | None], None] | None = None,
@@ -359,6 +390,7 @@ class AgentLoop:
             preset_snapshot_loader=preset_snapshot_loader,
         )
         self.dream_model_preset = dream_model_preset
+        self.fast_model_preset = fast_model_preset
         self.max_tool_result_chars = (
             max_tool_result_chars
             if max_tool_result_chars is not None
@@ -528,6 +560,7 @@ class AgentLoop:
             model_presets=preset_helpers.configured_model_presets(config),
             model_preset=defaults.model_preset,
             dream_model_preset=defaults.dream.model_override,
+            fast_model_preset=defaults.fast_model_preset,
             restart_mode=config.gateway.restart_mode,
             provider_snapshot_loader=provider_snapshot_loader,
             preset_snapshot_loader=preset_snapshot_loader,
@@ -2436,7 +2469,7 @@ class AgentLoop:
             ctx.streamed_content,
             turn_latency_ms=ctx.turn_latency_ms,
         )
-        if ctx.ephemeral and ctx.outbound is not None:
+        if ctx.outbound is not None:
             ctx.outbound.metadata["_stop_reason"] = ctx.stop_reason
 
     def _sanitize_persisted_blocks(

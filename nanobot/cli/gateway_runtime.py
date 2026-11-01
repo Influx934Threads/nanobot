@@ -251,6 +251,11 @@ _HEARTBEAT_PREAMBLE = (
 )
 
 
+# Stop reasons on a fast-preset background turn that mean it didn't really
+# finish — worth re-running on the default model rather than shipping as-is.
+_FAST_MODEL_ESCALATION_REASONS = frozenset({"max_iterations", "error"})
+
+
 def _heartbeat_has_active_tasks(content: str) -> bool:
     """True if HEARTBEAT.md has task lines, ignoring headers, blanks and comments."""
     in_comment = False
@@ -749,13 +754,27 @@ def _run_claimed_gateway(
                 suppress_token = message_tool.set_suppress_delivery(True)
             try:
                 await mcp_provider.connect()
+                fast_runtime = agent.background_runtime(content)
                 resp = await agent.process_direct(
                     prompt,
                     session_key=HEARTBEAT_SESSION_KEY,
                     channel=channel,
                     chat_id=chat_id,
                     on_progress=_silent,
+                    runtime=fast_runtime,
                 )
+                # The fast preset can run out of steps or error out on a task
+                # that turns out to need real reasoning — hand it to the
+                # default model instead of shipping a half-finished attempt.
+                if fast_runtime is not None and (resp is None or resp.metadata.get("_stop_reason") in _FAST_MODEL_ESCALATION_REASONS):
+                    logger.info("Heartbeat: fast model ({}) didn't finish, retrying with default model", fast_runtime.model)
+                    resp = await agent.process_direct(
+                        prompt,
+                        session_key=HEARTBEAT_SESSION_KEY,
+                        channel=channel,
+                        chat_id=chat_id,
+                        on_progress=_silent,
+                    )
             finally:
                 if isinstance(message_tool, MessageTool) and suppress_token is not None:
                     message_tool.reset_suppress_delivery(suppress_token)

@@ -169,6 +169,7 @@ class AgentDefaults(Base):
 
     workspace: str = Field(default_factory=get_default_workspace)
     model_preset: str | None = None  # Active preset name — takes precedence over fields below
+    fast_model_preset: str | None = None  # Preset used for routine background tasks (cron/heartbeat)
     model: str = "anthropic/claude-opus-4-5"
     provider: str = (
         "auto"  # Provider name (e.g. "anthropic", "openrouter") or "auto" for auto-detection
@@ -557,6 +558,9 @@ class Config(BaseSettings):
         dream_name = self.agents.defaults.dream.model_override
         if dream_name and dream_name != "default" and dream_name not in self.model_presets:
             raise ValueError(f"Dream model preset {dream_name!r} not found in model_presets")
+        fast_name = self.agents.defaults.fast_model_preset
+        if fast_name and fast_name != "default" and fast_name not in self.model_presets:
+            raise ValueError(f"fast_model_preset {fast_name!r} not found in model_presets")
         for fallback in self.agents.defaults.fallback_models:
             if isinstance(fallback, str) and fallback not in self.model_presets:
                 raise ValueError(f"fallback_models entry {fallback!r} not found in model_presets")

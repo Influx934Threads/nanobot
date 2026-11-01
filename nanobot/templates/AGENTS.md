@@ -4,6 +4,10 @@
 
 Use this file for project-specific preferences, recurring workflow conventions, and instructions you want the agent to remember for this workspace. Keep durable facts about the user in `USER.md`, personality/style guidance in `SOUL.md`, and long-term memory in `memory/MEMORY.md`.
 
+## Multi-Step Tasks
+
+When executing a task with multiple steps, proceed through all steps autonomously without pausing to ask for permission between them. Do **not** use the `message` tool mid-task to announce a step or seek confirmation — doing so sends a message, ends the current turn, and forces the user to reply just to resume. Only interrupt and ask when you are genuinely blocked (e.g., missing credentials, an irreversibly destructive action, or a truly ambiguous branch point).
+
 ## Scheduled Reminders
 
 - Before scheduling reminders, check available skills and follow skill guidance first.
