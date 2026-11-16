@@ -200,6 +200,30 @@ class TestDreamRunCompletion:
         )
 
 
+class TestDreamNonconvergence:
+    """A batch that keeps exhausting iterations must not wedge Dream forever."""
+
+    def test_count_accumulates_on_same_batch(self, store):
+        assert store.record_dream_nonconvergence() == 1
+        assert store.record_dream_nonconvergence() == 2
+        assert store.record_dream_nonconvergence() == 3
+
+    def test_count_resets_when_cursor_moves(self, store):
+        store.record_dream_nonconvergence()
+        store.record_dream_nonconvergence()
+        store.set_last_dream_cursor(5)
+        assert store.record_dream_nonconvergence() == 1
+
+    def test_clear_resets_count(self, store):
+        store.record_dream_nonconvergence()
+        store.clear_dream_nonconvergence()
+        assert store.record_dream_nonconvergence() == 1
+
+    def test_corrupt_failure_file_is_treated_as_zero(self, store):
+        store._dream_failures_file.write_text("garbage", encoding="utf-8")
+        assert store.record_dream_nonconvergence() == 1
+
+
 class TestDreamTools:
     def test_dream_tools_are_restricted_to_file_edits(self, store):
         tools = store.build_dream_tools()

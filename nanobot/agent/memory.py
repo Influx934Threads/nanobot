@@ -487,6 +487,36 @@ class MemoryStore:
     def set_last_dream_cursor(self, cursor: int) -> None:
         self._dream_cursor_file.write_text(str(cursor), encoding="utf-8")
 
+    # Consecutive max_iterations runs on the same batch before it is skipped.
+    DREAM_MAX_NONCONVERGING_RUNS = 3
+
+    @property
+    def _dream_failures_file(self) -> Path:
+        return self.memory_dir / ".dream_failures"
+
+    def record_dream_nonconvergence(self) -> int:
+        """Count a Dream run that exhausted its iterations on the current batch.
+
+        The count is keyed by the Dream cursor the batch starts from, so it
+        resets on its own once the cursor moves. Returns the consecutive count.
+        """
+        start = self.get_last_dream_cursor()
+        count = 0
+        with suppress(ValueError, OSError):
+            raw_start, raw_count = (
+                self._dream_failures_file.read_text(encoding="utf-8").split()
+            )
+            if int(raw_start) == start:
+                count = int(raw_count)
+        count += 1
+        with suppress(OSError):
+            self._dream_failures_file.write_text(f"{start} {count}", encoding="utf-8")
+        return count
+
+    def clear_dream_nonconvergence(self) -> None:
+        with suppress(OSError):
+            self._dream_failures_file.unlink(missing_ok=True)
+
     def get_latest_cursor(self) -> int:
         return max(self._next_cursor() - 1, 0)
 

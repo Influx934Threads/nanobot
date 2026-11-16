@@ -693,6 +693,7 @@ def _run_claimed_gateway(
                 diff_body = store.dream_content_diff()
                 completed = MemoryStore.dream_run_completed(resp)
                 if completed:
+                    store.clear_dream_nonconvergence()
                     store.set_last_dream_cursor(last_cursor)
                     if diff_body:
                         logger.info(
@@ -711,6 +712,25 @@ def _run_claimed_gateway(
                         MemoryStore.dream_incompletion_reason(resp),
                         store.get_last_dream_cursor(),
                     )
+                    # Only a deterministic non-convergence (iteration budget
+                    # exhausted) can wedge a batch; transient errors must not
+                    # cause skipping. The entries stay in history.jsonl.
+                    metadata = getattr(resp, "metadata", None)
+                    if (
+                        isinstance(metadata, dict)
+                        and metadata.get("_stop_reason") == "max_iterations"
+                    ):
+                        runs = store.record_dream_nonconvergence()
+                        if runs >= MemoryStore.DREAM_MAX_NONCONVERGING_RUNS:
+                            logger.warning(
+                                "Dream batch ending at cursor {} exhausted its iterations "
+                                "{} runs in a row; skipping it (entries remain in "
+                                "history.jsonl)",
+                                last_cursor,
+                                runs,
+                            )
+                            store.set_last_dream_cursor(last_cursor)
+                            store.clear_dream_nonconvergence()
             except Exception:
                 logger.exception("Dream cron job failed")
             finally:
