@@ -262,3 +262,16 @@ Tagged `cutover-2026-10-24` (alongside the existing Phase 0 safety tag `pre-upgr
 **Monthly sync cadence — now set up**: created a real, session-bound nanobot cron job (`2908f022`, "Monthly nanobot upstream-drift check"), firing `0 9 1 * *` Europe/Madrid (1st of each month, 09:00). Bound to the Telegram session (`telegram:6820175335`, matching the real existing session pattern used by the legacy DSPM jobs) so the report lands there automatically, and the task instructs the agent to also email a copy to `ciberjos@gmail.com` via its own message tool. Task: `git fetch origin` + count commits past the fork point + skim the latest upstream log for anything security-relevant, with `UPSTREAM_DRIFT_PLAN.md` as context. Written directly into the real cron store (`~/.nanobot/workspace/cron/jobs.json`, now 5 jobs) — confirmed the live `CronService` reloads its store from disk on every tick (by design, to merge concurrent writers), so no gateway restart was needed for this job to go live.
 
 All four phases of this plan are now complete.
+
+## 11. Post-cutover local ports (added after the 0.4.0 rebuild)
+
+Entries here are category **(b)** — still needed, no upstream equivalent — and must be re-applied or re-checked at every monthly drift cutover, same as the §6 ports.
+
+### Dream: skip a batch after 3 consecutive `max_iterations` runs (added 2026-11-16)
+
+- **Problem:** a Dream batch that exhausts its iteration budget leaves the cursor unchanged, so every later run redoes the same batch. On 2026-11-06/07/11/15 this cost the thinker 3–6.5 h/day and the cursor sat at 738–740 for days. Full record: Claude memory `project_nanobot_dream_tuning.md`.
+- **Change:** `MemoryStore.record_dream_nonconvergence()` / `clear_dream_nonconvergence()` plus `DREAM_MAX_NONCONVERGING_RUNS = 3` in `nanobot/agent/memory.py`, state in untracked `memory/.dream_failures` (keyed by the start cursor). The Dream handler in `nanobot/cli/gateway_runtime.py` clears it on success and, on a `max_iterations` stop, counts it and advances the cursor past the batch at the third strike (entries stay in `history.jsonl`). Only `max_iterations` counts — errors and stalls never cause a skip. Tests: `TestDreamNonconvergence` in `tests/agent/test_dream.py`.
+- **Upstream status (checked 2026-11-16):** `origin/main` still logs "Dream cron job did not complete ... cursor remains" with no backoff. The patch applied cleanly to `origin/main` (`git apply --check` against a temporary index). Upstream changed `memory.py` and `gateway_runtime.py` since v0.4.0, so re-check the Dream handler hunk at the next cutover.
+- **Possible upstream PR:** off `origin/main` as `pr/dream-nonconvergence-skip`. Since it silently skips a consolidation batch, upstream would likely want it opt-in (e.g. a `dream.max_nonconverging_runs` setting). Not started.
+- **Companion config (not code, lives in `~/.nanobot`):** `agents.defaults.dream` = `{cron: "30 3 * * *", modelOverride: "fast"}` and the workspace override `prompts/dream.md`. These survive a code cutover but must be re-checked if the config schema changes.
+- **Known conflict forecast (2026-11-16):** merging `origin/main` into this branch conflicts only in `nanobot/providers/base.py` and `tests/agent/test_runner_fallback.py` (the §6 cold-start retry port vs upstream NAN-313). This port does not add to that.
