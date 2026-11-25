@@ -1385,11 +1385,48 @@ class WebFetchTool(Tool):
             )
 
         result = None
-        if self.config.use_jina_reader and jina_remote_safe:
+        if self.config.webfetcher_url:
+            result = await self._fetch_webfetcher(url, max_chars)
+        if result is None and self.config.use_jina_reader and jina_remote_safe:
             result = await self._fetch_jina(url, max_chars)
         if result is None:
             result = await self._fetch_readability(url, extract_mode, max_chars)
         return result
+
+    async def _fetch_webfetcher(self, url: str, max_chars: int) -> str | None:
+        """Try fetching via a self-hosted webfetcher's /md endpoint. Returns None on failure.
+
+        No credential/third-party check like Jina's: this is a LAN box under the
+        same control as nanobot itself, not an external service the URL is handed to.
+        """
+        base = self.config.webfetcher_url.rstrip("/")
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                r = await client.get(f"{base}/md", params={"url": url})
+                r.raise_for_status()
+                data = r.json()
+
+            if not data.get("success") or not data.get("markdown"):
+                return None
+
+            text = data["markdown"]
+            truncated = len(text) > max_chars
+            if truncated:
+                text = text[:max_chars]
+            text = f"{_UNTRUSTED_BANNER}\n\n{text}"
+
+            return json.dumps({
+                "url": url, "finalUrl": url, "status": r.status_code,
+                "extractor": f"webfetcher:{data.get('engine', 'unknown')}", "truncated": truncated,
+                "length": len(text), "untrusted": True, "text": text,
+            }, ensure_ascii=False)
+        except Exception as e:
+            logger.debug(
+                "webfetcher fetch failed for {}, falling back ({})",
+                _redact_url_for_log(url),
+                type(e).__name__,
+            )
+            return None
 
     async def _fetch_jina(self, url: str, max_chars: int) -> str | None:
         """Try fetching via Jina Reader API. Returns None on failure."""

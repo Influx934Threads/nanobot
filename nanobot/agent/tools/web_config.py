@@ -17,6 +17,11 @@ class WebSearchConfig(Base):
 class WebFetchConfig(Base):
     """Web fetch tool configuration."""
     use_jina_reader: bool = True
+    # Self-hosted webfetcher (e.g. the GPU-BEAST service technews already uses):
+    # tried before Jina/readability when set, since it's LAN-local and keeps
+    # fetched URLs off a third-party reader. Expects a GET {url}/md?url=... that
+    # returns {"success": bool, "markdown": str, "engine": str}.
+    webfetcher_url: str = ""
 
 
 class WebToolsConfig(Base):
