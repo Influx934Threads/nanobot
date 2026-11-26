@@ -1398,15 +1398,27 @@ class WebFetchTool(Tool):
 
         No credential/third-party check like Jina's: this is a LAN box under the
         same control as nanobot itself, not an external service the URL is handed to.
+
+        A response carrying ``markers`` (bot-wall phrases such as a Cloudflare
+        challenge or a captcha page, which webfetcher detects but still returns
+        as success) is treated as a failure, so the next fetcher gets a try
+        instead of the agent receiving the challenge page as the article.
         """
         base = self.config.webfetcher_url.rstrip("/")
         try:
-            async with httpx.AsyncClient(timeout=30.0) as client:
+            async with httpx.AsyncClient(timeout=self.config.webfetcher_timeout_s) as client:
                 r = await client.get(f"{base}/md", params={"url": url})
                 r.raise_for_status()
                 data = r.json()
 
             if not data.get("success") or not data.get("markdown"):
+                return None
+            if data.get("markers"):
+                logger.debug(
+                    "webfetcher hit a bot wall for {} ({}), falling back",
+                    _redact_url_for_log(url),
+                    ", ".join(map(str, data["markers"])),
+                )
                 return None
 
             text = data["markdown"]

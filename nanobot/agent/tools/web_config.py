@@ -17,11 +17,16 @@ class WebSearchConfig(Base):
 class WebFetchConfig(Base):
     """Web fetch tool configuration."""
     use_jina_reader: bool = True
-    # Self-hosted webfetcher (e.g. the GPU-BEAST service technews already uses):
+    # Self-hosted webfetcher (e.g. the LAN service technews already uses):
     # tried before Jina/readability when set, since it's LAN-local and keeps
     # fetched URLs off a third-party reader. Expects a GET {url}/md?url=... that
     # returns {"success": bool, "markdown": str, "engine": str}.
     webfetcher_url: str = ""
+    # Seconds to wait for /md. The webfetcher service can take ~60 s on a slow
+    # page (a 30 s moli attempt, then a 30 s retry), plus queueing behind its
+    # concurrency limit; a shorter wait abandons that work and falls through
+    # to Jina, handing the URL to the third party after all.
+    webfetcher_timeout_s: float = 75.0
 
 
 class WebToolsConfig(Base):

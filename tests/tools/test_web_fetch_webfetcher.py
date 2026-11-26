@@ -35,9 +35,10 @@ class _RecordingWebfetcherClient:
 
     requested: list[tuple[str, dict]] = []
     response_payload: dict = {"success": True, "markdown": "body text", "engine": "moli"}
+    timeouts: list = []
 
     def __init__(self, *args, **kwargs):
-        pass
+        _RecordingWebfetcherClient.timeouts.append(kwargs.get("timeout"))
 
     async def __aenter__(self):
         return self
@@ -53,6 +54,7 @@ class _RecordingWebfetcherClient:
 @pytest.fixture
 def webfetcher_client():
     _RecordingWebfetcherClient.requested = []
+    _RecordingWebfetcherClient.timeouts = []
     _RecordingWebfetcherClient.response_payload = {
         "success": True,
         "markdown": "body text",
@@ -63,7 +65,7 @@ def webfetcher_client():
 
 
 async def test_fetch_webfetcher_success(webfetcher_client) -> None:
-    tool = WebFetchTool(config=WebFetchConfig(webfetcher_url="http://192.168.1.146:9000"))
+    tool = WebFetchTool(config=WebFetchConfig(webfetcher_url="http://webfetcher.example:9000"))
     result = await tool._fetch_webfetcher("https://example.com/report", max_chars=1000)
 
     assert result is not None
@@ -71,15 +73,48 @@ async def test_fetch_webfetcher_success(webfetcher_client) -> None:
     assert data["extractor"] == "webfetcher:moli"
     assert "body text" in data["text"]
     assert webfetcher_client.requested == [
-        ("http://192.168.1.146:9000/md", {"url": "https://example.com/report"})
+        ("http://webfetcher.example:9000/md", {"url": "https://example.com/report"})
     ]
 
 
 async def test_fetch_webfetcher_returns_none_on_reported_failure(webfetcher_client) -> None:
     webfetcher_client.response_payload = {"success": False}
-    tool = WebFetchTool(config=WebFetchConfig(webfetcher_url="http://192.168.1.146:9000"))
+    tool = WebFetchTool(config=WebFetchConfig(webfetcher_url="http://webfetcher.example:9000"))
     result = await tool._fetch_webfetcher("https://example.com/report", max_chars=1000)
     assert result is None
+
+
+async def test_fetch_webfetcher_returns_none_on_bot_wall_markers(webfetcher_client) -> None:
+    """success=true with markers is a challenge page, not the article: fall back."""
+    webfetcher_client.response_payload = {
+        "success": True,
+        "markdown": "Just a moment... Checking your browser before accessing example.com",
+        "engine": "moli",
+        "markers": ["just a moment", "checking your browser"],
+    }
+    tool = WebFetchTool(config=WebFetchConfig(webfetcher_url="http://webfetcher.example:9000"))
+    result = await tool._fetch_webfetcher("https://example.com/report", max_chars=1000)
+    assert result is None
+
+
+async def test_fetch_webfetcher_empty_markers_is_success(webfetcher_client) -> None:
+    webfetcher_client.response_payload = {
+        "success": True, "markdown": "body text", "engine": "moli", "markers": [],
+    }
+    tool = WebFetchTool(config=WebFetchConfig(webfetcher_url="http://webfetcher.example:9000"))
+    assert await tool._fetch_webfetcher("https://example.com/report", max_chars=1000)
+
+
+async def test_fetch_webfetcher_uses_configured_timeout(webfetcher_client) -> None:
+    tool = WebFetchTool(config=WebFetchConfig(
+        webfetcher_url="http://webfetcher.example:9000", webfetcher_timeout_s=12.5))
+    await tool._fetch_webfetcher("https://example.com/report", max_chars=1000)
+    assert webfetcher_client.timeouts == [12.5]
+
+
+def test_default_timeout_outlasts_webfetcher_retry_path() -> None:
+    """/md can take a 30 s moli attempt plus a 30 s retry; the default must wait for both."""
+    assert WebFetchConfig().webfetcher_timeout_s > 60
 
 
 async def test_fetch_webfetcher_returns_none_on_transport_error(webfetcher_client) -> None:
@@ -88,14 +123,14 @@ async def test_fetch_webfetcher_returns_none_on_transport_error(webfetcher_clien
             raise RuntimeError("connection refused")
 
     with patch("nanobot.agent.tools.web.httpx.AsyncClient", _RaisingClient):
-        tool = WebFetchTool(config=WebFetchConfig(webfetcher_url="http://192.168.1.146:9000"))
+        tool = WebFetchTool(config=WebFetchConfig(webfetcher_url="http://webfetcher.example:9000"))
         result = await tool._fetch_webfetcher("https://example.com/report", max_chars=1000)
     assert result is None
 
 
 async def test_execute_prefers_webfetcher_over_jina(monkeypatch, webfetcher_client) -> None:
     """When webfetcher_url is set, execute() should use it and never call Jina."""
-    tool = WebFetchTool(config=WebFetchConfig(webfetcher_url="http://192.168.1.146:9000"))
+    tool = WebFetchTool(config=WebFetchConfig(webfetcher_url="http://webfetcher.example:9000"))
     jina_called = False
 
     async def _fail_if_called(*args, **kwargs):
